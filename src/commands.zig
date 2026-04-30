@@ -125,9 +125,13 @@ fn handleTrack(
     }
 
     try tracker.backfillSubscriber(chat_id, pr_number, branches);
-    _ = tracker.pruneIfComplete(pr_number) catch |err| {
+    const pruned = tracker.pruneIfComplete(pr_number) catch |err| blk: {
         std.log.warn("track pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
+        break :blk @as(usize, 0);
     };
+    // Auto-untrack already sent its own ✅ message; skip the Tracking reply
+    // to avoid implying the subscription is still active.
+    if (pruned > 0) return;
 
     const meta = try db.getMeta(allocator, pr_number);
     defer if (meta) |m| m.deinit(allocator);
