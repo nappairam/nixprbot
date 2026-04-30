@@ -69,7 +69,9 @@ pub const Client = struct {
         defer resp.deinit();
 
         if (resp.status != .ok) {
-            std.log.warn("github getPr {d} status={d}", .{ pr_number, @intFromEnum(resp.status) });
+            std.log.warn("github getPr {d} status={d} body={s}", .{
+                pr_number, @intFromEnum(resp.status), resp.body,
+            });
             return error.GithubHttpError;
         }
 

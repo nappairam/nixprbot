@@ -44,7 +44,9 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         const now = Io.Clock.Timestamp.now(io, .awake);
         const elapsed = last_status_poll.durationTo(now);
+        const elapsed_s = @divTrunc(elapsed.raw.nanoseconds, std.time.ns_per_s);
         if (elapsed.raw.nanoseconds >= interval.raw.nanoseconds) {
+            std.log.info("status poll triggered (elapsed={d}s)", .{elapsed_s});
             poller.runOnce(gpa, &db, &gh, &tg, cfg.channels) catch |err| {
                 std.log.warn("status poll failed: {s}", .{@errorName(err)});
             };
@@ -57,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         const tg_ns: i96 = @max(min_tg_ns, @min(max_tg_ns, remaining_ns));
         const tg_timeout: u32 = @intCast(@divTrunc(tg_ns, std.time.ns_per_s));
 
+        std.log.debug("telegram poll offset={d} timeout={d}s", .{ offset, tg_timeout });
         var updates = tg.getUpdates(offset, tg_timeout) catch |err| {
             std.log.warn("getUpdates failed: {s}", .{@errorName(err)});
             Io.Clock.Duration.sleep(.{ .raw = .{ .nanoseconds = 2 * std.time.ns_per_s }, .clock = .awake }, io) catch {};
@@ -64,6 +67,9 @@ pub fn main(init: std.process.Init) !void {
         };
         defer updates.deinit();
 
+        if (updates.items().len > 0) {
+            std.log.info("got {d} update(s)", .{updates.items().len});
+        }
         for (updates.items()) |u| {
             commands.dispatch(gpa, &db, &tg, u) catch |err| {
                 std.log.warn("dispatch update {d} failed: {s}", .{ u.update_id, @errorName(err) });

@@ -54,6 +54,8 @@ pub fn dispatch(
     const cmd = stripBotSuffix(cmd_raw);
     const arg_rest = it.rest();
 
+    std.log.info("cmd={s} user={d} chat={d} arg={s}", .{ cmd, user_id, chat_id, arg_rest });
+
     if (std.mem.eql(u8, cmd, "/track")) {
         try handleTrack(allocator, db, tg, chat_id, user_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/untrack")) {

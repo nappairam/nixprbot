@@ -126,6 +126,7 @@ pub fn runOnce(
 ) !void {
     const tracks = try db.allTracks(allocator);
     defer Db.freeTracks(allocator, tracks);
+    std.log.info("poller.runOnce tracks={d}", .{tracks.len});
     if (tracks.len == 0) return;
 
     var i: usize = 0;
@@ -135,12 +136,16 @@ pub fn runOnce(
         while (j < tracks.len and tracks[j].pr_number == pr_number) j += 1;
         defer i = j;
 
+        std.log.info("fetching PR #{d} ({d} subscriber(s))", .{ pr_number, j - i });
         var pr_parsed = gh.getPr(pr_number) catch |err| {
             std.log.warn("getPr {d} failed: {s}", .{ pr_number, @errorName(err) });
             continue;
         };
         defer pr_parsed.deinit();
         const pr = pr_parsed.value();
+        std.log.info("PR #{d} state={s} merged={} sha={?s}", .{
+            pr_number, pr.state, pr.merged, pr.merge_commit_sha,
+        });
 
         var channels: []github.Channel = &.{};
         defer if (channels.len > 0) github.Client.freeChannels(allocator, channels);
@@ -151,6 +156,9 @@ pub fn runOnce(
                 channels = gh.channelsForSha(sha, branches) catch blk: {
                     break :blk &.{};
                 };
+                for (channels) |c| {
+                    std.log.info("  channel {s}: {}", .{ c.name, c.contains });
+                }
             }
         }
 
@@ -177,12 +185,15 @@ pub fn runOnce(
             defer if (note) |n| allocator.free(n);
 
             if (note) |n| {
+                std.log.info("notify user={d} pr={d} bytes={d}", .{ t.user_id, pr_number, n.len });
                 tg.sendMessage(t.user_id, n) catch |err| {
                     std.log.warn("notify {d} pr={d} failed: {s}", .{ t.user_id, pr_number, @errorName(err) });
                 };
                 db.updateState(t.user_id, pr_number, new_json) catch |err| {
                     std.log.warn("updateState {d}/{d} failed: {s}", .{ t.user_id, pr_number, @errorName(err) });
                 };
+            } else {
+                std.log.info("no change for user={d} pr={d}", .{ t.user_id, pr_number });
             }
         }
     }
