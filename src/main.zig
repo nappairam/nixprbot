@@ -13,6 +13,22 @@ pub const std_options: std.Options = .{
     .logFn = timestampedLog,
 };
 
+var shutdown_flag: std.atomic.Value(bool) = .init(false);
+
+fn shutdownHandler(_: std.posix.SIG) callconv(.c) void {
+    shutdown_flag.store(true, .seq_cst);
+}
+
+fn installSignalHandlers() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = shutdownHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 fn timestampedLog(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -52,8 +68,19 @@ pub fn main(init: std.process.Init) !void {
     var gh = github.Client.init(gpa, &http_client, cfg.github_token, cfg.repo);
     var tracker = poller.Tracker.init(gpa, &db, &gh, &tg, cfg.branches);
 
-    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d}", .{
-        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len,
+    installSignalHandlers();
+
+    tg.setMyCommands(&.{
+        .{ .command = "track", .description = "Track a PR (e.g. /track 312345)" },
+        .{ .command = "untrack", .description = "Stop tracking a PR" },
+        .{ .command = "list", .description = "List tracked PRs" },
+        .{ .command = "status", .description = "Show current status of a PR" },
+        .{ .command = "help", .description = "Show help" },
+    }) catch |err| std.log.warn("setMyCommands failed: {s}", .{@errorName(err)});
+
+    const has_token = cfg.github_token != null and cfg.github_token.?.len > 0;
+    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d} gh_auth={}", .{
+        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len, has_token,
     });
 
     const interval_ns: i96 = @as(i96, @intCast(cfg.poll_interval_sec)) * std.time.ns_per_s;
@@ -67,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
         .clock = .awake,
     });
 
-    while (true) {
+    while (!shutdown_flag.load(.seq_cst)) {
         const now = Io.Clock.Timestamp.now(io, .awake);
         const elapsed = last_status_poll.durationTo(now);
         const elapsed_s = @divTrunc(elapsed.raw.nanoseconds, std.time.ns_per_s);
@@ -97,10 +124,11 @@ pub fn main(init: std.process.Init) !void {
             std.log.info("got {d} update(s)", .{updates.items().len});
         }
         for (updates.items()) |u| {
-            commands.dispatch(gpa, &db, &tg, &tracker, cfg.branches, u) catch |err| {
+            commands.dispatch(gpa, &db, &tg, &tracker, cfg.branches, cfg.repo, u) catch |err| {
                 std.log.warn("dispatch update {d} failed: {s}", .{ u.update_id, @errorName(err) });
             };
             offset = u.update_id + 1;
         }
     }
+    std.log.info("shutdown signal received; exiting cleanly", .{});
 }

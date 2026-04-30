@@ -28,25 +28,33 @@ pub const PrParsed = struct {
 pub const Client = struct {
     http: *http.Client,
     allocator: std.mem.Allocator,
-    token: []const u8,
+    token: ?[]const u8,
     repo: []const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
         http_client: *http.Client,
-        token: []const u8,
+        token: ?[]const u8,
         repo: []const u8,
     ) Client {
         return .{ .http = http_client, .allocator = allocator, .token = token, .repo = repo };
     }
 
     fn defaultHeaders(self: *Client, allocator: std.mem.Allocator) ![]http.Header {
-        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.token});
-        const headers = try allocator.alloc(http.Header, 4);
-        headers[0] = .{ .name = "authorization", .value = auth };
-        headers[1] = .{ .name = "user-agent", .value = user_agent };
-        headers[2] = .{ .name = "accept", .value = "application/vnd.github+json" };
-        headers[3] = .{ .name = "x-github-api-version", .value = "2022-11-28" };
+        const has_token = self.token != null and self.token.?.len > 0;
+        const n: usize = if (has_token) 4 else 3;
+        const headers = try allocator.alloc(http.Header, n);
+        var idx: usize = 0;
+        if (has_token) {
+            const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.token.?});
+            headers[idx] = .{ .name = "authorization", .value = auth };
+            idx += 1;
+        }
+        headers[idx] = .{ .name = "user-agent", .value = user_agent };
+        idx += 1;
+        headers[idx] = .{ .name = "accept", .value = "application/vnd.github+json" };
+        idx += 1;
+        headers[idx] = .{ .name = "x-github-api-version", .value = "2022-11-28" };
         return headers;
     }
 

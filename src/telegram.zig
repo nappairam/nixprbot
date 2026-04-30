@@ -104,6 +104,37 @@ pub const Client = struct {
             return error.TelegramHttpError;
         }
     }
+
+    pub const Command = struct {
+        command: []const u8,
+        description: []const u8,
+    };
+
+    pub fn setMyCommands(self: *Client, commands_list: []const Command) !void {
+        const url = try self.methodUrl(self.allocator, "setMyCommands");
+        defer self.allocator.free(url);
+
+        var body_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body_buf.deinit();
+        try std.json.Stringify.value(.{
+            .commands = commands_list,
+        }, .{}, &body_buf.writer);
+
+        var resp = try self.http.request(.{
+            .url = url,
+            .method = .POST,
+            .body = body_buf.written(),
+            .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        });
+        defer resp.deinit();
+
+        if (resp.status != .ok) {
+            std.log.warn("setMyCommands status={d} body={s}", .{
+                @intFromEnum(resp.status), resp.body,
+            });
+            return error.TelegramHttpError;
+        }
+    }
 };
 
 test "parse getUpdates envelope" {

@@ -9,6 +9,16 @@ pub const Error = error{
     InvalidPrReference,
 };
 
+/// HTML-escape user-supplied text for Telegram parse_mode=HTML.
+fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        else => try w.writeByte(c),
+    };
+}
+
 pub fn parsePrReference(arg: []const u8) !i64 {
     const trimmed = std.mem.trim(u8, arg, " \t\r\n");
     if (trimmed.len == 0) return Error.InvalidPrReference;
@@ -43,6 +53,7 @@ pub fn dispatch(
     tg: *TelegramClient,
     tracker: *tracker_mod.Tracker,
     branches: []const []const u8,
+    repo: []const u8,
     update: Update,
 ) !void {
     const msg = update.message orelse return;
@@ -60,11 +71,11 @@ pub fn dispatch(
     std.log.info("cmd={s} chat={d} arg={s}", .{ cmd, chat_id, arg_rest });
 
     if (std.mem.eql(u8, cmd, "/track")) {
-        try handleTrack(allocator, db, tg, tracker, branches, chat_id, arg_rest);
+        try handleTrack(allocator, db, tg, tracker, branches, repo, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/untrack")) {
         try handleUntrack(allocator, db, tg, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/list")) {
-        try handleList(allocator, db, tg, branches, chat_id);
+        try handleList(allocator, db, tg, branches, repo, chat_id);
     } else if (std.mem.eql(u8, cmd, "/status")) {
         try handleStatus(allocator, db, tg, tracker, branches, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/start") or std.mem.eql(u8, cmd, "/help")) {
@@ -83,6 +94,7 @@ fn handleTrack(
     tg: *TelegramClient,
     tracker: *tracker_mod.Tracker,
     branches: []const []const u8,
+    repo: []const u8,
     chat_id: i64,
     arg: []const u8,
 ) !void {
@@ -91,24 +103,39 @@ fn handleTrack(
         return;
     };
 
+    const added = try db.subscribe(chat_id, pr_number);
     const found = tracker.refreshPr(pr_number) catch |err| {
         std.log.warn("track refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
         try tg.sendMessage(chat_id, "Couldn't fetch PR — try again later.");
         return;
     };
     if (!found) {
+        _ = try db.unsubscribe(chat_id, pr_number);
         const m = try std.fmt.allocPrint(allocator, "PR #{d} not found.", .{pr_number});
         defer allocator.free(m);
         try tg.sendMessage(chat_id, m);
         return;
     }
 
-    const added = try db.subscribe(chat_id, pr_number);
+    try tracker.backfillSubscriber(chat_id, pr_number, branches);
+
+    const meta = try db.getMeta(allocator, pr_number);
+    defer if (meta) |m| m.deinit(allocator);
+
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
     const lead = if (added) "Tracking" else "Already tracking";
-    try buf.writer.print("{s} PR #{d}\n", .{ lead, pr_number });
-    try writeStatusBody(allocator, db, &buf.writer, branches, pr_number);
+    try buf.writer.print("{s} <a href=\"https://github.com/{s}/pull/{d}\">PR #{d}</a>", .{
+        lead, repo, pr_number, pr_number,
+    });
+    if (meta) |m| {
+        if (m.title) |t| {
+            try buf.writer.writeAll(": ");
+            try writeEscaped(&buf.writer, t);
+        }
+        const label = if (m.merged) "merged" else (m.state orelse "unknown");
+        try buf.writer.print("\nState: <code>{s}</code>", .{label});
+    }
     try tg.sendMessage(chat_id, buf.written());
 }
 
@@ -137,6 +164,7 @@ fn handleList(
     db: *Db,
     tg: *TelegramClient,
     branches: []const []const u8,
+    repo: []const u8,
     chat_id: i64,
 ) !void {
     _ = branches;
@@ -157,7 +185,7 @@ fn handleList(
         const reached = try db.reachedStages(allocator, pr_number);
         defer Db.freeStrings(allocator, reached);
 
-        const title = if (meta) |m| (m.title orelse "(unknown)") else "(unknown)";
+        const title_raw = if (meta) |m| (m.title orelse "(unknown)") else "(unknown)";
         const state_label = blk: {
             if (meta) |m| {
                 if (m.merged) break :blk "merged";
@@ -166,9 +194,10 @@ fn handleList(
             break :blk "unknown";
         };
         try buf.writer.print(
-            "\n• #{d} [<code>{s}</code>] {s}",
-            .{ pr_number, state_label, title },
+            "\n• <a href=\"https://github.com/{s}/pull/{d}\">#{d}</a> [<code>{s}</code>] ",
+            .{ repo, pr_number, pr_number, state_label },
         );
+        try writeEscaped(&buf.writer, title_raw);
         if (reached.len > 0) {
             try buf.writer.writeAll("\n   stages: ");
             for (reached, 0..) |s, k| {
@@ -225,9 +254,9 @@ fn writeStatusBody(
 
     if (meta) |m| {
         const label = if (m.merged) "merged" else (m.state orelse "unknown");
-        try w.print("<b>{s}</b>\nState: <code>{s}</code>\n", .{
-            m.title orelse "(unknown)", label,
-        });
+        try w.writeAll("<b>");
+        try writeEscaped(w, m.title orelse "(unknown)");
+        try w.print("</b>\nState: <code>{s}</code>\n", .{label});
     }
     for (branches) |b| {
         const mark: []const u8 = if (containsBranchSlice(reached, b)) "✅" else "⬜";

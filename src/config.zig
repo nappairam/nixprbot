@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Config = struct {
     bot_token: []const u8,
-    github_token: []const u8,
+    github_token: ?[]const u8,
     db_path: []const u8,
     poll_interval_sec: u64,
     branches: []const []const u8,
@@ -17,7 +17,6 @@ pub const Config = struct {
 
 pub const ConfigError = error{
     MissingBotToken,
-    MissingGithubToken,
     InvalidPollInterval,
 };
 
@@ -32,7 +31,7 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
     const a = arena.allocator();
 
     const bot_token = env.get("NIXPRBOT_TOKEN") orelse return ConfigError.MissingBotToken;
-    const github_token = env.get("NIXPRBOT_GITHUB_TOKEN") orelse return ConfigError.MissingGithubToken;
+    const github_token = env.get("NIXPRBOT_GITHUB_TOKEN");
     const db_path = env.get("NIXPRBOT_DB_PATH") orelse default_db_path;
 
     const poll_interval_sec = if (env.get("NIXPRBOT_POLL_INTERVAL_SEC")) |s|
@@ -46,7 +45,7 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
 
     return .{
         .bot_token = try a.dupe(u8, bot_token),
-        .github_token = try a.dupe(u8, github_token),
+        .github_token = if (github_token) |t| try a.dupe(u8, t) else null,
         .db_path = try a.dupe(u8, db_path),
         .poll_interval_sec = poll_interval_sec,
         .branches = branches,
