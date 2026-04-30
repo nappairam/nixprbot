@@ -33,7 +33,14 @@ pub const Db = struct {
             "DELETE FROM subscriptions WHERE chat_id = ?1 AND pr_number = ?2",
             .{ chat_id, pr_number },
         );
-        return self.conn.changes() > 0;
+        const removed = self.conn.changes() > 0;
+        if (removed) {
+            try self.conn.exec(
+                "DELETE FROM notified WHERE chat_id = ?1 AND pr_number = ?2",
+                .{ chat_id, pr_number },
+            );
+        }
+        return removed;
     }
 
     pub fn listSubscriptions(
@@ -295,4 +302,6 @@ test "subscriptions and stages" {
 
     try std.testing.expect(try db.unsubscribe(42, 100));
     try std.testing.expect(!(try db.unsubscribe(42, 100)));
+    // unsubscribe wipes notified rows for that (chat, pr) so re-track replays.
+    try std.testing.expect(!(try db.alreadyNotified(42, 100, "master")));
 }
