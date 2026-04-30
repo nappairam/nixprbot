@@ -2,3 +2,5 @@
 zig-out/
 zig-pkg/
 *.sqlite
+result
+result-*
