@@ -104,20 +104,30 @@ fn handleTrack(
     };
 
     const added = try db.subscribe(chat_id, pr_number);
-    const found = tracker.refreshPr(pr_number) catch |err| {
-        std.log.warn("track refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
-        try tg.sendMessage(chat_id, "Couldn't fetch PR — try again later.");
-        return;
-    };
-    if (!found) {
-        _ = try db.unsubscribe(chat_id, pr_number);
-        const m = try std.fmt.allocPrint(allocator, "PR #{d} not found.", .{pr_number});
-        defer allocator.free(m);
-        try tg.sendMessage(chat_id, m);
-        return;
+
+    // Fast path: PR already at every branch in cache, skip GitHub round-trip.
+    const cached_complete = try tracker.isComplete(pr_number);
+    if (cached_complete) {
+        std.log.info("cache hit: PR #{d} already complete", .{pr_number});
+    } else {
+        const found = tracker.refreshPr(pr_number) catch |err| {
+            std.log.warn("track refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
+            try tg.sendMessage(chat_id, "Couldn't fetch PR — try again later.");
+            return;
+        };
+        if (!found) {
+            _ = try db.unsubscribe(chat_id, pr_number);
+            const m = try std.fmt.allocPrint(allocator, "PR #{d} not found.", .{pr_number});
+            defer allocator.free(m);
+            try tg.sendMessage(chat_id, m);
+            return;
+        }
     }
 
     try tracker.backfillSubscriber(chat_id, pr_number, branches);
+    _ = tracker.pruneIfComplete(pr_number) catch |err| {
+        std.log.warn("track pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
+    };
 
     const meta = try db.getMeta(allocator, pr_number);
     defer if (meta) |m| m.deinit(allocator);

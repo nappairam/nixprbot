@@ -203,8 +203,62 @@ pub const Tracker = struct {
                 std.log.warn("refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
                 break :blk false;
             };
-            if (!ok) std.log.debug("refreshPr {d} returned not-found", .{pr_number});
+            if (!ok) {
+                std.log.debug("refreshPr {d} returned not-found", .{pr_number});
+                continue;
+            }
+            _ = self.pruneIfComplete(pr_number) catch |err| {
+                std.log.warn("pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
+            };
         }
+    }
+
+    /// Returns true if cached pr_meta + pr_stage indicate the PR has reached
+    /// every configured branch. Pure cache lookup, no GitHub call.
+    pub fn isComplete(self: *Tracker, pr_number: i64) !bool {
+        const meta = try self.db.getMeta(self.allocator, pr_number);
+        defer if (meta) |m| m.deinit(self.allocator);
+        const m = meta orelse return false;
+        if (!m.merged) return false;
+
+        const reached = try self.db.reachedStages(self.allocator, pr_number);
+        defer Db.freeStrings(self.allocator, reached);
+        for (self.branches) |b| if (!containsBranch(reached, b)) return false;
+        return true;
+    }
+
+    /// If the PR has reached all configured branches, drop every subscription
+    /// for it. pr_meta and pr_stage are kept so future /track requests for the
+    /// same PR can serve from cache without a GitHub round-trip.
+    /// Returns the number of subscriptions removed.
+    pub fn pruneIfComplete(self: *Tracker, pr_number: i64) !usize {
+        if (!try self.isComplete(pr_number)) return 0;
+        const subs = try self.db.subscribers(self.allocator, pr_number);
+        defer self.allocator.free(subs);
+        if (subs.len == 0) return 0;
+
+        const text = try std.fmt.allocPrint(
+            self.allocator,
+            "✅ PR #{d} reached all configured branches; auto-untracked.",
+            .{pr_number},
+        );
+        defer self.allocator.free(text);
+
+        for (subs) |chat_id| {
+            _ = self.db.unsubscribe(chat_id, pr_number) catch |err| {
+                std.log.warn("auto-untrack chat={d} pr={d}: {s}", .{
+                    chat_id, pr_number, @errorName(err),
+                });
+                continue;
+            };
+            self.tg.sendMessage(chat_id, text) catch |err| {
+                std.log.warn("auto-untrack notify chat={d} pr={d}: {s}", .{
+                    chat_id, pr_number, @errorName(err),
+                });
+            };
+        }
+        std.log.info("auto-untracked PR #{d} ({d} sub(s))", .{ pr_number, subs.len });
+        return subs.len;
     }
 };
 
