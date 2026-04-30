@@ -29,6 +29,20 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+var stderr_color_state: enum(u8) { unknown, on, off } = .unknown;
+
+fn stderrIsTty() bool {
+    return switch (stderr_color_state) {
+        .unknown => blk: {
+            const tty = std.c.isatty(std.posix.STDERR_FILENO) != 0;
+            stderr_color_state = if (tty) .on else .off;
+            break :blk tty;
+        },
+        .on => true,
+        .off => false,
+    };
+}
+
 fn timestampedLog(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -43,9 +57,23 @@ fn timestampedLog(
     const m = (day_secs % 3600) / 60;
     const s = day_secs % 60;
     const ms: u32 = @intCast(@divTrunc(ts.nsec, 1_000_000));
-    std.debug.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} {s}: ", .{
-        h, m, s, ms, comptime level.asText(),
-    });
+
+    const color: []const u8 = comptime switch (level) {
+        .err => "\x1b[31m",
+        .warn => "\x1b[33m",
+        .info => "\x1b[32m",
+        .debug => "\x1b[35m",
+    };
+    const reset = "\x1b[0m";
+    if (stderrIsTty()) {
+        std.debug.print("\x1b[2m{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}{s} {s}{s}{s}: ", .{
+            h, m, s, ms, reset, color, comptime level.asText(), reset,
+        });
+    } else {
+        std.debug.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} {s}: ", .{
+            h, m, s, ms, comptime level.asText(),
+        });
+    }
     std.debug.print(format ++ "\n", args);
 }
 
