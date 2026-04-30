@@ -21,7 +21,7 @@ pub fn parsePrReference(arg: []const u8) !i64 {
         return std.fmt.parseInt(i64, rest, 10) catch return Error.InvalidPrReference;
     }
 
-    const numeric = std.mem.trimLeft(u8, trimmed, "#");
+    const numeric = std.mem.trimStart(u8, trimmed, "#");
     return std.fmt.parseInt(i64, numeric, 10) catch return Error.InvalidPrReference;
 }
 

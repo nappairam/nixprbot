@@ -24,13 +24,10 @@ const default_db_path = "nixprbot.sqlite";
 const default_poll_interval_sec: u64 = 900;
 const default_channels = "staging,staging-next,master,nixpkgs-unstable,nixos-unstable";
 
-pub fn load(parent_allocator: std.mem.Allocator) !Config {
+pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
-
-    var env = try std.process.getEnvMap(a);
-    defer env.deinit();
 
     const bot_token = env.get("BOT_TOKEN") orelse return ConfigError.MissingBotToken;
     const github_token = env.get("GITHUB_TOKEN") orelse return ConfigError.MissingGithubToken;
