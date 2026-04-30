@@ -60,7 +60,7 @@ pub fn dispatch(
     std.log.info("cmd={s} chat={d} arg={s}", .{ cmd, chat_id, arg_rest });
 
     if (std.mem.eql(u8, cmd, "/track")) {
-        try handleTrack(allocator, db, tg, tracker, chat_id, arg_rest);
+        try handleTrack(allocator, db, tg, tracker, branches, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/untrack")) {
         try handleUntrack(allocator, db, tg, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/list")) {
@@ -82,6 +82,7 @@ fn handleTrack(
     db: *Db,
     tg: *TelegramClient,
     tracker: *tracker_mod.Tracker,
+    branches: []const []const u8,
     chat_id: i64,
     arg: []const u8,
 ) !void {
@@ -103,21 +104,11 @@ fn handleTrack(
     }
 
     const added = try db.subscribe(chat_id, pr_number);
-    const meta = try db.getMeta(allocator, pr_number);
-    defer if (meta) |m| m.deinit(allocator);
-
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
-    if (added) {
-        try buf.writer.print("Tracking PR #{d}", .{pr_number});
-        if (meta) |m| {
-            if (m.title) |t| try buf.writer.print(": {s}", .{t});
-            const label = if (m.merged) "merged" else (m.state orelse "unknown");
-            try buf.writer.print("\nState: <code>{s}</code>", .{label});
-        }
-    } else {
-        try buf.writer.print("Already tracking PR #{d}.", .{pr_number});
-    }
+    const lead = if (added) "Tracking" else "Already tracking";
+    try buf.writer.print("{s} PR #{d}\n", .{ lead, pr_number });
+    try writeStatusBody(allocator, db, &buf.writer, branches, pr_number);
     try tg.sendMessage(chat_id, buf.written());
 }
 
@@ -214,26 +205,34 @@ fn handleStatus(
         return;
     }
 
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try writeStatusBody(allocator, db, &buf.writer, branches, pr_number);
+    try tg.sendMessage(chat_id, buf.written());
+}
+
+fn writeStatusBody(
+    allocator: std.mem.Allocator,
+    db: *Db,
+    w: *std.Io.Writer,
+    branches: []const []const u8,
+    pr_number: i64,
+) !void {
     const meta = try db.getMeta(allocator, pr_number);
     defer if (meta) |m| m.deinit(allocator);
     const reached = try db.reachedStages(allocator, pr_number);
     defer Db.freeStrings(allocator, reached);
 
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    defer buf.deinit();
     if (meta) |m| {
         const label = if (m.merged) "merged" else (m.state orelse "unknown");
-        try buf.writer.print("PR #{d}: {s}\nState: <code>{s}</code>\n", .{
-            pr_number, m.title orelse "(unknown)", label,
+        try w.print("<b>{s}</b>\nState: <code>{s}</code>\n", .{
+            m.title orelse "(unknown)", label,
         });
-    } else {
-        try buf.writer.print("PR #{d}\n", .{pr_number});
     }
     for (branches) |b| {
         const mark: []const u8 = if (containsBranchSlice(reached, b)) "✅" else "⬜";
-        try buf.writer.print("{s} {s}\n", .{ mark, b });
+        try w.print("{s} {s}\n", .{ mark, b });
     }
-    try tg.sendMessage(chat_id, buf.written());
 }
 
 fn containsBranchSlice(reached: []const []u8, branch: []const u8) bool {
