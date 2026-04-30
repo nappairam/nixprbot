@@ -29,16 +29,16 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const bot_token = env.get("BOT_TOKEN") orelse return ConfigError.MissingBotToken;
-    const github_token = env.get("GITHUB_TOKEN") orelse return ConfigError.MissingGithubToken;
-    const db_path = env.get("DB_PATH") orelse default_db_path;
+    const bot_token = env.get("NIXPRBOT_TOKEN") orelse return ConfigError.MissingBotToken;
+    const github_token = env.get("NIXPRBOT_GITHUB_TOKEN") orelse return ConfigError.MissingGithubToken;
+    const db_path = env.get("NIXPRBOT_DB_PATH") orelse default_db_path;
 
-    const poll_interval_sec = if (env.get("POLL_INTERVAL_SEC")) |s|
+    const poll_interval_sec = if (env.get("NIXPRBOT_POLL_INTERVAL_SEC")) |s|
         std.fmt.parseInt(u64, s, 10) catch return ConfigError.InvalidPollInterval
     else
         default_poll_interval_sec;
 
-    const channels_csv = env.get("CHANNELS") orelse default_channels;
+    const channels_csv = env.get("NIXPRBOT_CHANNELS") orelse default_channels;
     const channels = try splitCsv(a, channels_csv);
 
     return .{
