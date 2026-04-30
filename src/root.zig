@@ -4,3 +4,4 @@ pub const http = @import("http.zig");
 pub const telegram = @import("telegram.zig");
 pub const commands = @import("commands.zig");
 pub const github = @import("github.zig");
+pub const poller = @import("poller.zig");
