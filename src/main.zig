@@ -24,10 +24,11 @@ pub fn main(init: std.process.Init) !void {
     defer http_client.deinit();
 
     var tg = telegram.Client.init(gpa, &http_client, cfg.bot_token);
-    var gh = github.Client.init(gpa, &http_client, cfg.github_token);
+    var gh = github.Client.init(gpa, &http_client, cfg.github_token, cfg.repo);
+    var tracker = poller.Tracker.init(gpa, &db, &gh, &tg, cfg.branches);
 
-    std.log.info("nixprbot up. db={s} interval={d}s channels={d}", .{
-        cfg.db_path, cfg.poll_interval_sec, cfg.channels.len,
+    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d}", .{
+        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len,
     });
 
     const interval_ns: i96 = @as(i96, @intCast(cfg.poll_interval_sec)) * std.time.ns_per_s;
@@ -47,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         const elapsed_s = @divTrunc(elapsed.raw.nanoseconds, std.time.ns_per_s);
         if (elapsed.raw.nanoseconds >= interval.raw.nanoseconds) {
             std.log.info("status poll triggered (elapsed={d}s)", .{elapsed_s});
-            poller.runOnce(gpa, &db, &gh, &tg, cfg.channels) catch |err| {
+            tracker.runOnce() catch |err| {
                 std.log.warn("status poll failed: {s}", .{@errorName(err)});
             };
             last_status_poll = Io.Clock.Timestamp.now(io, .awake);
@@ -71,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
             std.log.info("got {d} update(s)", .{updates.items().len});
         }
         for (updates.items()) |u| {
-            commands.dispatch(gpa, &db, &tg, u) catch |err| {
+            commands.dispatch(gpa, &db, &tg, &tracker, cfg.branches, u) catch |err| {
                 std.log.warn("dispatch update {d} failed: {s}", .{ u.update_id, @errorName(err) });
             };
             offset = u.update_id + 1;

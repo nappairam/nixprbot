@@ -3,261 +3,166 @@ const Db = @import("db.zig").Db;
 const TelegramClient = @import("telegram.zig").Client;
 const github = @import("github.zig");
 
-pub const State = struct {
-    state: []const u8,
-    merged: bool,
-    title: []const u8,
-    html_url: []const u8,
-    channels: []const ChannelState,
-
-    pub const ChannelState = struct {
-        name: []const u8,
-        contains: bool,
-    };
+pub const Event = union(enum) {
+    merged,
+    closed,
+    stage: []const u8,
 };
 
-pub fn buildState(
-    allocator: std.mem.Allocator,
-    pr: github.Pr,
-    channels: []const github.Channel,
-) !State {
-    const cs = try allocator.alloc(State.ChannelState, channels.len);
-    for (channels, 0..) |c, i| {
-        cs[i] = .{ .name = c.name, .contains = c.contains };
-    }
-    return .{
-        .state = pr.state,
-        .merged = pr.merged,
-        .title = pr.title,
-        .html_url = pr.html_url,
-        .channels = cs,
+pub fn stageKey(event: Event) []const u8 {
+    return switch (event) {
+        .merged => "_merged",
+        .closed => "_closed",
+        .stage => |b| b,
     };
 }
 
-pub fn stateToJson(allocator: std.mem.Allocator, s: State) ![]u8 {
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    errdefer buf.deinit();
-    try std.json.Stringify.value(s, .{}, &buf.writer);
-    return buf.toOwnedSlice();
-}
-
-pub fn formatNotification(
-    allocator: std.mem.Allocator,
-    pr_number: i64,
-    prev_json: ?[]const u8,
-    new_state: State,
-) !?[]u8 {
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    errdefer buf.deinit();
-
-    if (prev_json == null) {
-        try buf.writer.print("Now tracking PR #{d}: {s}\n{s}\n", .{
-            pr_number, new_state.title, new_state.html_url,
-        });
-        try writeStatus(&buf.writer, new_state);
-        return try buf.toOwnedSlice();
-    }
-
-    const prev = try std.json.parseFromSlice(
-        State,
-        allocator,
-        prev_json.?,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    );
-    defer prev.deinit();
-
-    var changes: usize = 0;
-    try buf.writer.print("PR #{d}: {s}\n{s}\n", .{
-        pr_number, new_state.title, new_state.html_url,
-    });
-
-    if (!std.mem.eql(u8, prev.value.state, new_state.state) or prev.value.merged != new_state.merged) {
-        const prev_label = stateLabel(prev.value);
-        const new_label = stateLabel(new_state);
-        try buf.writer.print("- state: {s} -> {s}\n", .{ prev_label, new_label });
-        changes += 1;
-    }
-
-    for (new_state.channels) |nc| {
-        const prev_contains = findChannel(prev.value.channels, nc.name) orelse false;
-        if (prev_contains != nc.contains) {
-            const arrow = if (nc.contains) "reached" else "left";
-            try buf.writer.print("- {s} {s}\n", .{ arrow, nc.name });
-            changes += 1;
-        }
-    }
-
-    if (changes == 0) {
-        buf.deinit();
-        return null;
-    }
-    return try buf.toOwnedSlice();
-}
-
-fn stateLabel(s: State) []const u8 {
-    if (s.merged) return "merged";
-    return s.state;
-}
-
-fn findChannel(channels: []const State.ChannelState, name: []const u8) ?bool {
-    for (channels) |c| {
-        if (std.mem.eql(u8, c.name, name)) return c.contains;
-    }
-    return null;
-}
-
-fn writeStatus(w: *std.Io.Writer, s: State) !void {
-    try w.print("State: {s}\n", .{stateLabel(s)});
-    if (s.channels.len > 0) {
-        try w.writeAll("Channels:\n");
-        for (s.channels) |c| {
-            const mark: u8 = if (c.contains) '+' else '-';
-            try w.print("  [{c}] {s}\n", .{ mark, c.name });
-        }
-    }
-}
-
-pub fn runOnce(
+pub const Tracker = struct {
     allocator: std.mem.Allocator,
     db: *Db,
     gh: *github.Client,
     tg: *TelegramClient,
     branches: []const []const u8,
-) !void {
-    const tracks = try db.allTracks(allocator);
-    defer Db.freeTracks(allocator, tracks);
-    std.log.info("poller.runOnce tracks={d}", .{tracks.len});
-    if (tracks.len == 0) return;
 
-    var i: usize = 0;
-    while (i < tracks.len) {
-        const pr_number = tracks[i].pr_number;
-        var j = i + 1;
-        while (j < tracks.len and tracks[j].pr_number == pr_number) j += 1;
-        defer i = j;
+    pub fn init(
+        allocator: std.mem.Allocator,
+        db: *Db,
+        gh: *github.Client,
+        tg: *TelegramClient,
+        branches: []const []const u8,
+    ) Tracker {
+        return .{ .allocator = allocator, .db = db, .gh = gh, .tg = tg, .branches = branches };
+    }
 
-        std.log.info("fetching PR #{d} ({d} subscriber(s))", .{ pr_number, j - i });
-        var pr_parsed = gh.getPr(pr_number) catch |err| {
-            std.log.warn("getPr {d} failed: {s}", .{ pr_number, @errorName(err) });
-            continue;
+    /// Refresh PR metadata from GitHub, emit transition events, and check
+    /// branch containment for any branches not yet reached. Returns false
+    /// if the PR is not found.
+    pub fn refreshPr(self: *Tracker, pr_number: i64) !bool {
+        var pr_parsed = self.gh.getPr(pr_number) catch |err| switch (err) {
+            error.GithubNotFound => return false,
+            else => return err,
         };
         defer pr_parsed.deinit();
         const pr = pr_parsed.value();
-        std.log.info("PR #{d} state={s} merged={} sha={?s}", .{
-            pr_number, pr.state, pr.merged, pr.merge_commit_sha,
-        });
 
-        var channels: []github.Channel = &.{};
-        defer if (channels.len > 0) github.Client.freeChannels(allocator, channels);
+        const prev = try self.db.getMeta(self.allocator, pr_number);
+        defer if (prev) |p| p.deinit(self.allocator);
+        const prev_merged = if (prev) |p| p.merged else false;
+        const prev_state: ?[]const u8 = if (prev) |p| p.state else null;
+
+        try self.db.upsertMeta(pr_number, pr.title, pr.state, pr.merged, pr.merge_commit_sha);
+
+        if (pr.merged and !prev_merged) {
+            try self.fanout(pr, .merged);
+        } else if (std.mem.eql(u8, pr.state, "closed") and !pr.merged) {
+            const was_closed = if (prev_state) |s| std.mem.eql(u8, s, "closed") else false;
+            if (!was_closed) try self.fanout(pr, .closed);
+        }
 
         if (pr.merged) {
-            const sha = pr.merge_commit_sha orelse "";
-            if (sha.len > 0) {
-                channels = gh.channelsForSha(sha, branches) catch blk: {
-                    break :blk &.{};
+            const sha = pr.merge_commit_sha orelse return true;
+            if (sha.len == 0) return true;
+
+            const reached = try self.db.reachedStages(self.allocator, pr_number);
+            defer Db.freeStrings(self.allocator, reached);
+
+            for (self.branches) |branch| {
+                if (containsBranch(reached, branch)) continue;
+                const in_branch = self.gh.commitInBranch(branch, sha) catch |err| {
+                    std.log.warn("compare {s} for PR #{d} failed: {s}", .{
+                        branch, pr_number, @errorName(err),
+                    });
+                    continue;
                 };
-                for (channels) |c| {
-                    std.log.info("  channel {s}: {}", .{ c.name, c.contains });
-                }
+                if (!in_branch) continue;
+                const newly = try self.db.recordStage(pr_number, branch);
+                if (newly) try self.fanout(pr, .{ .stage = branch });
             }
         }
 
-        const new_state = try buildState(allocator, pr, channels);
-        const new_json = try stateToJson(allocator, new_state);
-        defer allocator.free(new_json);
-        allocator.free(new_state.channels);
+        return true;
+    }
 
-        for (tracks[i..j]) |t| {
-            const note = formatNotification(allocator, pr_number, t.last_state_json, .{
-                .state = pr.state,
-                .merged = pr.merged,
-                .title = pr.title,
-                .html_url = pr.html_url,
-                .channels = blk: {
-                    const cs = try allocator.alloc(State.ChannelState, channels.len);
-                    for (channels, 0..) |c, k| cs[k] = .{ .name = c.name, .contains = c.contains };
-                    break :blk cs;
-                },
-            }) catch |err| {
-                std.log.warn("format notification failed for {d}/{d}: {s}", .{ t.user_id, pr_number, @errorName(err) });
+    fn fanout(self: *Tracker, pr: github.Pr, event: Event) !void {
+        const subs = try self.db.subscribers(self.allocator, pr.number);
+        defer self.allocator.free(subs);
+        if (subs.len == 0) return;
+
+        const stage = stageKey(event);
+        const text = try formatEvent(self.allocator, pr, event);
+        defer self.allocator.free(text);
+
+        std.log.info("fanout pr={d} stage={s} subs={d}", .{ pr.number, stage, subs.len });
+
+        for (subs) |chat_id| {
+            const seen = self.db.alreadyNotified(chat_id, pr.number, stage) catch |err| {
+                std.log.warn("alreadyNotified chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
                 continue;
             };
-            defer if (note) |n| allocator.free(n);
-
-            if (note) |n| {
-                std.log.info("notify user={d} pr={d} bytes={d}", .{ t.user_id, pr_number, n.len });
-                tg.sendMessage(t.user_id, n) catch |err| {
-                    std.log.warn("notify {d} pr={d} failed: {s}", .{ t.user_id, pr_number, @errorName(err) });
-                };
-                db.updateState(t.user_id, pr_number, new_json) catch |err| {
-                    std.log.warn("updateState {d}/{d} failed: {s}", .{ t.user_id, pr_number, @errorName(err) });
-                };
-            } else {
-                std.log.info("no change for user={d} pr={d}", .{ t.user_id, pr_number });
-            }
+            if (seen) continue;
+            self.tg.sendMessage(chat_id, text) catch |err| {
+                std.log.warn("notify chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
+                continue;
+            };
+            self.db.markNotified(chat_id, pr.number, stage) catch |err| {
+                std.log.warn("markNotified chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
+            };
         }
+    }
+
+    pub fn runOnce(self: *Tracker) !void {
+        const prs = try self.db.allTrackedPrs(self.allocator);
+        defer self.allocator.free(prs);
+        std.log.info("tracker.runOnce prs={d}", .{prs.len});
+        for (prs) |pr_number| {
+            _ = self.refreshPr(pr_number) catch |err| {
+                std.log.warn("refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
+            };
+        }
+    }
+};
+
+fn containsBranch(reached: []const []u8, branch: []const u8) bool {
+    for (reached) |r| {
+        if (std.mem.eql(u8, r, branch)) return true;
+    }
+    return false;
+}
+
+pub fn formatEvent(
+    allocator: std.mem.Allocator,
+    pr: github.Pr,
+    event: Event,
+) ![]u8 {
+    switch (event) {
+        .merged => return std.fmt.allocPrint(
+            allocator,
+            "🟣 <a href=\"{s}\">PR #{d}</a> was <b>merged</b>: {s}",
+            .{ pr.html_url, pr.number, pr.title },
+        ),
+        .closed => return std.fmt.allocPrint(
+            allocator,
+            "⚫ <a href=\"{s}\">PR #{d}</a> was <b>closed without merging</b>: {s}",
+            .{ pr.html_url, pr.number, pr.title },
+        ),
+        .stage => |branch| return std.fmt.allocPrint(
+            allocator,
+            "🟢 <a href=\"{s}\">PR #{d}</a> reached <code>{s}</code>",
+            .{ pr.html_url, pr.number, branch },
+        ),
     }
 }
 
-test "formatNotification new track" {
-    const a = std.testing.allocator;
-    const channels = [_]State.ChannelState{
-        .{ .name = "master", .contains = false },
-    };
-    const new_state: State = .{
-        .state = "open",
-        .merged = false,
-        .title = "fix foo",
-        .html_url = "https://github.com/NixOS/nixpkgs/pull/1",
-        .channels = &channels,
-    };
-    const out = try formatNotification(a, 1, null, new_state);
-    try std.testing.expect(out != null);
-    defer a.free(out.?);
-    try std.testing.expect(std.mem.indexOf(u8, out.?, "Now tracking") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.?, "fix foo") != null);
+test "stageKey" {
+    try std.testing.expectEqualStrings("_merged", stageKey(.merged));
+    try std.testing.expectEqualStrings("_closed", stageKey(.closed));
+    try std.testing.expectEqualStrings("master", stageKey(.{ .stage = "master" }));
 }
 
-test "formatNotification no change" {
-    const a = std.testing.allocator;
-    const prev_json =
-        \\{"state":"open","merged":false,"title":"fix foo",
-        \\ "html_url":"https://github.com/x/y/pull/1",
-        \\ "channels":[{"name":"master","contains":false}]}
-    ;
-    const channels = [_]State.ChannelState{
-        .{ .name = "master", .contains = false },
-    };
-    const new_state: State = .{
-        .state = "open",
-        .merged = false,
-        .title = "fix foo",
-        .html_url = "https://github.com/x/y/pull/1",
-        .channels = &channels,
-    };
-    const out = try formatNotification(a, 1, prev_json, new_state);
-    try std.testing.expect(out == null);
-}
-
-test "formatNotification channel reached" {
-    const a = std.testing.allocator;
-    const prev_json =
-        \\{"state":"open","merged":true,"title":"t","html_url":"u",
-        \\ "channels":[{"name":"master","contains":false},{"name":"nixos-unstable","contains":false}]}
-    ;
-    const channels = [_]State.ChannelState{
-        .{ .name = "master", .contains = true },
-        .{ .name = "nixos-unstable", .contains = false },
-    };
-    const new_state: State = .{
-        .state = "closed",
-        .merged = true,
-        .title = "t",
-        .html_url = "u",
-        .channels = &channels,
-    };
-    const out = try formatNotification(a, 5, prev_json, new_state);
-    try std.testing.expect(out != null);
-    defer a.free(out.?);
-    try std.testing.expect(std.mem.indexOf(u8, out.?, "reached master") != null);
+test "containsBranch" {
+    var a = "master".*;
+    var b = "staging".*;
+    var arr = [_][]u8{ &a, &b };
+    try std.testing.expect(containsBranch(&arr, "master"));
+    try std.testing.expect(!containsBranch(&arr, "nixos-unstable"));
 }

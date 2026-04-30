@@ -5,7 +5,8 @@ pub const Config = struct {
     github_token: []const u8,
     db_path: []const u8,
     poll_interval_sec: u64,
-    channels: []const []const u8,
+    branches: []const []const u8,
+    repo: []const u8,
 
     arena: std.heap.ArenaAllocator,
 
@@ -22,7 +23,8 @@ pub const ConfigError = error{
 
 const default_db_path = "nixprbot.sqlite";
 const default_poll_interval_sec: u64 = 900;
-const default_channels = "staging,staging-next,master,nixpkgs-unstable,nixos-unstable";
+const default_branches = "staging-next,master,nixpkgs-unstable,nixos-unstable-small,nixos-unstable";
+const default_repo = "NixOS/nixpkgs";
 
 pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
@@ -38,15 +40,17 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
     else
         default_poll_interval_sec;
 
-    const channels_csv = env.get("NIXPRBOT_CHANNELS") orelse default_channels;
-    const channels = try splitCsv(a, channels_csv);
+    const branches_csv = env.get("NIXPRBOT_BRANCHES") orelse default_branches;
+    const branches = try splitCsv(a, branches_csv);
+    const repo = env.get("NIXPRBOT_REPO") orelse default_repo;
 
     return .{
         .bot_token = try a.dupe(u8, bot_token),
         .github_token = try a.dupe(u8, github_token),
         .db_path = try a.dupe(u8, db_path),
         .poll_interval_sec = poll_interval_sec,
-        .channels = channels,
+        .branches = branches,
+        .repo = try a.dupe(u8, repo),
         .arena = arena,
     };
 }

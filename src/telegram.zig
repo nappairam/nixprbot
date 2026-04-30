@@ -87,7 +87,7 @@ pub const Client = struct {
         try std.json.Stringify.value(.{
             .chat_id = chat_id,
             .text = text,
-            .parse_mode = "Markdown",
+            .parse_mode = "HTML",
             .disable_web_page_preview = true,
         }, .{ .emit_null_optional_fields = false }, &body_buf.writer);
 

@@ -1,8 +1,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 
-pub const repo_owner = "NixOS";
-pub const repo_name = "nixpkgs";
+pub const default_repo = "NixOS/nixpkgs";
 pub const user_agent = "nixprbot/0.1";
 
 pub const Pr = struct {
@@ -26,30 +25,28 @@ pub const PrParsed = struct {
     }
 };
 
-pub const Channel = struct {
-    name: []const u8,
-    contains: bool,
-};
-
 pub const Client = struct {
     http: *http.Client,
     allocator: std.mem.Allocator,
     token: []const u8,
+    repo: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, http_client: *http.Client, token: []const u8) Client {
-        return .{ .http = http_client, .allocator = allocator, .token = token };
-    }
-
-    fn authHeader(self: *Client, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "Bearer {s}", .{self.token});
+    pub fn init(
+        allocator: std.mem.Allocator,
+        http_client: *http.Client,
+        token: []const u8,
+        repo: []const u8,
+    ) Client {
+        return .{ .http = http_client, .allocator = allocator, .token = token, .repo = repo };
     }
 
     fn defaultHeaders(self: *Client, allocator: std.mem.Allocator) ![]http.Header {
-        const auth = try self.authHeader(allocator);
-        const headers = try allocator.alloc(http.Header, 3);
+        const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.token});
+        const headers = try allocator.alloc(http.Header, 4);
         headers[0] = .{ .name = "authorization", .value = auth };
         headers[1] = .{ .name = "user-agent", .value = user_agent };
         headers[2] = .{ .name = "accept", .value = "application/vnd.github+json" };
+        headers[3] = .{ .name = "x-github-api-version", .value = "2022-11-28" };
         return headers;
     }
 
@@ -60,14 +57,15 @@ pub const Client = struct {
 
         const url = try std.fmt.allocPrint(
             a,
-            "https://api.github.com/repos/{s}/{s}/pulls/{d}",
-            .{ repo_owner, repo_name, pr_number },
+            "https://api.github.com/repos/{s}/pulls/{d}",
+            .{ self.repo, pr_number },
         );
         const headers = try self.defaultHeaders(a);
 
         var resp = try self.http.request(.{ .url = url, .headers = headers });
         defer resp.deinit();
 
+        if (resp.status == .not_found) return error.GithubNotFound;
         if (resp.status != .ok) {
             std.log.warn("github getPr {d} status={d} body={s}", .{
                 pr_number, @intFromEnum(resp.status), resp.body,
@@ -84,24 +82,29 @@ pub const Client = struct {
         return .{ .parsed = parsed };
     }
 
-    pub fn compareStatus(self: *Client, base: []const u8, head: []const u8) ![]u8 {
+    /// Returns true when commit_sha is reachable from branch HEAD using the
+    /// compare endpoint. status of "identical" or "behind" both indicate
+    /// that the commit is an ancestor of branch.
+    pub fn commitInBranch(self: *Client, branch: []const u8, commit_sha: []const u8) !bool {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
 
         const url = try std.fmt.allocPrint(
             a,
-            "https://api.github.com/repos/{s}/{s}/compare/{s}...{s}",
-            .{ repo_owner, repo_name, base, head },
+            "https://api.github.com/repos/{s}/compare/{s}...{s}",
+            .{ self.repo, branch, commit_sha },
         );
         const headers = try self.defaultHeaders(a);
 
         var resp = try self.http.request(.{ .url = url, .headers = headers });
         defer resp.deinit();
 
-        if (resp.status == .not_found) return self.allocator.dupe(u8, "unknown");
+        if (resp.status == .not_found) return false;
         if (resp.status != .ok) {
-            std.log.warn("github compare {s}...{s} status={d}", .{ base, head, @intFromEnum(resp.status) });
+            std.log.warn("github compare {s}...{s} status={d}", .{
+                branch, commit_sha, @intFromEnum(resp.status),
+            });
             return error.GithubHttpError;
         }
 
@@ -113,35 +116,9 @@ pub const Client = struct {
             .{ .ignore_unknown_fields = true },
         );
         defer parsed.deinit();
-        return self.allocator.dupe(u8, parsed.value.status);
-    }
 
-    /// Returns slice of channels with `contains` indicating whether the
-    /// merge commit is reachable from each branch. Caller frees with
-    /// `freeChannels`. Channel order matches input.
-    pub fn channelsForSha(
-        self: *Client,
-        sha: []const u8,
-        branches: []const []const u8,
-    ) ![]Channel {
-        var out = try self.allocator.alloc(Channel, branches.len);
-        errdefer self.allocator.free(out);
-        for (branches, 0..) |branch, i| {
-            const status = self.compareStatus(branch, sha) catch |err| {
-                std.log.warn("compare {s}...{s} failed: {s}", .{ branch, sha, @errorName(err) });
-                out[i] = .{ .name = try self.allocator.dupe(u8, branch), .contains = false };
-                continue;
-            };
-            defer self.allocator.free(status);
-            const contains = std.mem.eql(u8, status, "behind") or std.mem.eql(u8, status, "identical");
-            out[i] = .{ .name = try self.allocator.dupe(u8, branch), .contains = contains };
-        }
-        return out;
-    }
-
-    pub fn freeChannels(allocator: std.mem.Allocator, channels: []Channel) void {
-        for (channels) |c| allocator.free(c.name);
-        allocator.free(channels);
+        return std.mem.eql(u8, parsed.value.status, "identical") or
+            std.mem.eql(u8, parsed.value.status, "behind");
     }
 };
 
