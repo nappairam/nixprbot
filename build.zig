@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "zqlite", .module = zqlite.module("zqlite") },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
