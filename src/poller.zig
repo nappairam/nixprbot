@@ -38,8 +38,12 @@ pub const Tracker = struct {
     /// branch containment for any branches not yet reached. Returns false
     /// if the PR is not found.
     pub fn refreshPr(self: *Tracker, pr_number: i64) !bool {
+        std.log.debug("refreshPr {d}", .{pr_number});
         var pr_parsed = self.gh.getPr(pr_number) catch |err| switch (err) {
-            error.GithubNotFound => return false,
+            error.GithubNotFound => {
+                std.log.warn("refreshPr {d}: not found", .{pr_number});
+                return false;
+            },
             else => return err,
         };
         defer pr_parsed.deinit();
@@ -51,6 +55,9 @@ pub const Tracker = struct {
         const prev_state: ?[]const u8 = if (prev) |p| p.state else null;
 
         try self.db.upsertMeta(pr_number, pr.title, pr.state, pr.merged, pr.merge_commit_sha);
+        std.log.debug("PR #{d} state={s} merged={} prev_merged={} prev_state={?s}", .{
+            pr_number, pr.state, pr.merged, prev_merged, prev_state,
+        });
 
         if (pr.merged and !prev_merged) {
             try self.fanout(pr, .merged);
@@ -60,24 +67,39 @@ pub const Tracker = struct {
         }
 
         if (pr.merged) {
-            const sha = pr.merge_commit_sha orelse return true;
-            if (sha.len == 0) return true;
+            const sha = pr.merge_commit_sha orelse {
+                std.log.debug("PR #{d} merged but no merge_commit_sha; skipping branch check", .{pr_number});
+                return true;
+            };
+            if (sha.len == 0) {
+                std.log.debug("PR #{d} merge_commit_sha empty", .{pr_number});
+                return true;
+            }
+            std.log.debug("PR #{d} merge_commit_sha={s}", .{ pr_number, sha });
 
             const reached = try self.db.reachedStages(self.allocator, pr_number);
             defer Db.freeStrings(self.allocator, reached);
+            std.log.debug("PR #{d} reached_stages={d} branches_to_check={d}", .{
+                pr_number, reached.len, self.branches.len,
+            });
 
             for (self.branches) |branch| {
-                if (containsBranch(reached, branch)) continue;
+                if (containsBranch(reached, branch)) {
+                    std.log.debug("  {s}: already reached, skip", .{branch});
+                    continue;
+                }
                 const in_branch = self.gh.commitInBranch(branch, sha) catch |err| {
-                    std.log.warn("compare {s} for PR #{d} failed: {s}", .{
-                        branch, pr_number, @errorName(err),
-                    });
+                    std.log.warn("  compare {s}: {s}", .{ branch, @errorName(err) });
                     continue;
                 };
+                std.log.debug("  {s}: contains={}", .{ branch, in_branch });
                 if (!in_branch) continue;
                 const newly = try self.db.recordStage(pr_number, branch);
+                std.log.debug("  recordStage {s}: newly={}", .{ branch, newly });
                 if (newly) try self.fanout(pr, .{ .stage = branch });
             }
+        } else {
+            std.log.debug("PR #{d} not merged (state={s}); skipping branch check", .{ pr_number, pr.state });
         }
 
         return true;
@@ -86,24 +108,28 @@ pub const Tracker = struct {
     fn fanout(self: *Tracker, pr: github.Pr, event: Event) !void {
         const subs = try self.db.subscribers(self.allocator, pr.number);
         defer self.allocator.free(subs);
-        if (subs.len == 0) return;
 
         const stage = stageKey(event);
+        std.log.info("fanout pr={d} stage={s} subs={d}", .{ pr.number, stage, subs.len });
+        if (subs.len == 0) return;
+
         const text = try formatEvent(self.allocator, pr, event);
         defer self.allocator.free(text);
-
-        std.log.info("fanout pr={d} stage={s} subs={d}", .{ pr.number, stage, subs.len });
 
         for (subs) |chat_id| {
             const seen = self.db.alreadyNotified(chat_id, pr.number, stage) catch |err| {
                 std.log.warn("alreadyNotified chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
                 continue;
             };
-            if (seen) continue;
+            if (seen) {
+                std.log.debug("  chat={d}: already notified, skip", .{chat_id});
+                continue;
+            }
             self.tg.sendMessage(chat_id, text) catch |err| {
                 std.log.warn("notify chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
                 continue;
             };
+            std.log.debug("  chat={d}: sent", .{chat_id});
             self.db.markNotified(chat_id, pr.number, stage) catch |err| {
                 std.log.warn("markNotified chat={d} pr={d}: {s}", .{ chat_id, pr.number, @errorName(err) });
             };
@@ -115,9 +141,11 @@ pub const Tracker = struct {
         defer self.allocator.free(prs);
         std.log.info("tracker.runOnce prs={d}", .{prs.len});
         for (prs) |pr_number| {
-            _ = self.refreshPr(pr_number) catch |err| {
+            const ok = self.refreshPr(pr_number) catch |err| blk: {
                 std.log.warn("refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
+                break :blk false;
             };
+            if (!ok) std.log.debug("refreshPr {d} returned not-found", .{pr_number});
         }
     }
 };

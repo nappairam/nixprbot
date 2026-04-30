@@ -8,6 +8,31 @@ const github = @import("github.zig");
 const commands = @import("commands.zig");
 const poller = @import("poller.zig");
 
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = timestampedLog,
+};
+
+fn timestampedLog(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    const day_secs: u64 = @as(u64, @intCast(@mod(ts.sec, 86400)));
+    const h = day_secs / 3600;
+    const m = (day_secs % 3600) / 60;
+    const s = day_secs % 60;
+    const ms: u32 = @intCast(@divTrunc(ts.nsec, 1_000_000));
+    std.debug.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} {s}: ", .{
+        h, m, s, ms, comptime level.asText(),
+    });
+    std.debug.print(format ++ "\n", args);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
