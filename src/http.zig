@@ -16,11 +16,13 @@ pub const Response = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    io: Io,
     inner: std.http.Client,
 
     pub fn init(allocator: std.mem.Allocator, io: Io) Client {
         return .{
             .allocator = allocator,
+            .io = io,
             .inner = .{ .allocator = allocator, .io = io },
         };
     }
@@ -37,6 +39,14 @@ pub const Client = struct {
     };
 
     pub fn request(self: *Client, opts: RequestOptions) !Response {
+        // std.http.Client freezes `now` on first TLS handshake and reuses it
+        // for every subsequent cert validity check. After the upstream rotates
+        // its certificate, the new `notBefore` may be later than that frozen
+        // time, producing TlsInitializationFailed. Refresh before each call.
+        if (self.inner.now != null) {
+            self.inner.now = Io.Clock.real.now(self.io);
+        }
+
         var alloc_w: Io.Writer.Allocating = .init(self.allocator);
         errdefer alloc_w.deinit();
 
