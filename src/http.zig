@@ -31,6 +31,16 @@ pub const Client = struct {
         self.inner.deinit();
     }
 
+    /// Drop the inner client — connection pool included — and start fresh.
+    /// Zig 0.16's std.http.Client re-pools a keep-alive connection whose
+    /// send failed (Request.deinit sees reader.state == .ready and keeps it),
+    /// so a dead socket otherwise gets handed back out on every retry,
+    /// forever. This wedged the previous deployment for 68 days.
+    pub fn reset(self: *Client) void {
+        self.inner.deinit();
+        self.inner = .{ .allocator = self.allocator, .io = self.io };
+    }
+
     pub const RequestOptions = struct {
         method: ?Method = null,
         url: []const u8,
@@ -48,17 +58,23 @@ pub const Client = struct {
         }
 
         var alloc_w: Io.Writer.Allocating = .init(self.allocator);
-        errdefer alloc_w.deinit();
 
-        const result = try self.inner.fetch(.{
+        const result = self.inner.fetch(.{
             .location = .{ .url = opts.url },
             .method = opts.method,
             .payload = opts.body,
             .extra_headers = opts.headers,
             .response_writer = &alloc_w.writer,
-        });
+        }) catch |err| {
+            alloc_w.deinit();
+            self.reset();
+            return err;
+        };
 
-        const body = try alloc_w.toOwnedSlice();
+        const body = alloc_w.toOwnedSlice() catch |err| {
+            alloc_w.deinit();
+            return err;
+        };
         return .{
             .status = result.status,
             .body = body,

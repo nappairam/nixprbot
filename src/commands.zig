@@ -2,8 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const TelegramClient = @import("telegram.zig").Client;
 const Update = @import("telegram.zig").Update;
-const github = @import("github.zig");
-const tracker_mod = @import("poller.zig");
+const tracker_mod = @import("tracker.zig");
 
 pub const Error = error{
     InvalidPrReference,
@@ -47,6 +46,14 @@ const help_text =
     \\/help — show this help
 ;
 
+fn fetchErrorReply(err: anyerror) []const u8 {
+    return switch (err) {
+        error.GithubUnauthorized => "⚠️ GitHub rejected the bot's token — tracking is paused until the operator fixes it.",
+        error.GithubRateLimited => "GitHub rate limit hit — try again in a few minutes.",
+        else => "Couldn't fetch PR — try again later.",
+    };
+}
+
 pub fn dispatch(
     allocator: std.mem.Allocator,
     db: *Db,
@@ -75,7 +82,7 @@ pub fn dispatch(
     } else if (std.mem.eql(u8, cmd, "/untrack")) {
         try handleUntrack(allocator, db, tg, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/list")) {
-        try handleList(allocator, db, tg, branches, repo, chat_id);
+        try handleList(allocator, db, tg, repo, chat_id);
     } else if (std.mem.eql(u8, cmd, "/status")) {
         try handleStatus(allocator, db, tg, tracker, branches, chat_id, arg_rest);
     } else if (std.mem.eql(u8, cmd, "/start") or std.mem.eql(u8, cmd, "/help")) {
@@ -110,9 +117,11 @@ fn handleTrack(
     if (cached_complete) {
         std.log.info("cache hit: PR #{d} already complete", .{pr_number});
     } else {
+        // Subscription survives a failed refresh on purpose: the next sweep
+        // picks the PR up once GitHub is reachable again.
         const found = tracker.refreshPr(pr_number) catch |err| {
             std.log.warn("track refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
-            try tg.sendMessage(chat_id, "Couldn't fetch PR — try again later.");
+            try tg.sendMessage(chat_id, fetchErrorReply(err));
             return;
         };
         if (!found) {
@@ -125,11 +134,18 @@ fn handleTrack(
     }
 
     try tracker.backfillSubscriber(chat_id, pr_number, branches);
-    const pruned = tracker.pruneIfComplete(pr_number) catch |err| blk: {
-        std.log.warn("track pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
-        break :blk @as(usize, 0);
+    const pruned = blk: {
+        const complete = tracker.pruneIfComplete(pr_number) catch |err| {
+            std.log.warn("track pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
+            break :blk @as(usize, 0);
+        };
+        if (complete > 0) break :blk complete;
+        break :blk tracker.pruneIfClosed(pr_number) catch |err| {
+            std.log.warn("track pruneIfClosed {d}: {s}", .{ pr_number, @errorName(err) });
+            break :blk @as(usize, 0);
+        };
     };
-    // Auto-untrack already sent its own ✅ message; skip the Tracking reply
+    // Auto-untrack already sent its own message; skip the Tracking reply
     // to avoid implying the subscription is still active.
     if (pruned > 0) return;
 
@@ -177,11 +193,9 @@ fn handleList(
     allocator: std.mem.Allocator,
     db: *Db,
     tg: *TelegramClient,
-    branches: []const []const u8,
     repo: []const u8,
     chat_id: i64,
 ) !void {
-    _ = branches;
     const prs = try db.listSubscriptions(allocator, chat_id);
     defer allocator.free(prs);
 
@@ -238,7 +252,7 @@ fn handleStatus(
     };
     const found = tracker.refreshPr(pr_number) catch |err| {
         std.log.warn("status refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
-        try tg.sendMessage(chat_id, "Couldn't fetch status — try again later.");
+        try tg.sendMessage(chat_id, fetchErrorReply(err));
         return;
     };
     if (!found) {

@@ -2,11 +2,12 @@ const std = @import("std");
 
 pub const Config = struct {
     bot_token: []const u8,
-    github_token: ?[]const u8,
+    github_token: []const u8,
     db_path: []const u8,
     poll_interval_sec: u64,
     branches: []const []const u8,
     repo: []const u8,
+    log_level: std.log.Level,
 
     arena: std.heap.ArenaAllocator,
 
@@ -17,7 +18,9 @@ pub const Config = struct {
 
 pub const ConfigError = error{
     MissingBotToken,
+    MissingGithubToken,
     InvalidPollInterval,
+    InvalidLogLevel,
 };
 
 const default_db_path = "nixprbot.sqlite";
@@ -31,7 +34,10 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
     const a = arena.allocator();
 
     const bot_token = env.get("NIXPRBOT_TOKEN") orelse return ConfigError.MissingBotToken;
-    const github_token = env.get("NIXPRBOT_GITHUB_TOKEN");
+    // Unauthenticated GitHub gets 60 requests/hour — one busy PR eats that.
+    // Require the token so quota failures are configuration errors, not fate.
+    const github_token = env.get("NIXPRBOT_GITHUB_TOKEN") orelse return ConfigError.MissingGithubToken;
+    if (github_token.len == 0) return ConfigError.MissingGithubToken;
     const db_path = env.get("NIXPRBOT_DB_PATH") orelse default_db_path;
 
     const poll_interval_sec = if (env.get("NIXPRBOT_POLL_INTERVAL_SEC")) |s|
@@ -43,15 +49,29 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
     const branches = try splitCsv(a, branches_csv);
     const repo = env.get("NIXPRBOT_REPO") orelse default_repo;
 
+    const log_level = if (env.get("NIXPRBOT_LOG")) |s|
+        parseLogLevel(s) orelse return ConfigError.InvalidLogLevel
+    else
+        .info;
+
     return .{
         .bot_token = try a.dupe(u8, bot_token),
-        .github_token = if (github_token) |t| try a.dupe(u8, t) else null,
+        .github_token = try a.dupe(u8, github_token),
         .db_path = try a.dupe(u8, db_path),
         .poll_interval_sec = poll_interval_sec,
         .branches = branches,
         .repo = try a.dupe(u8, repo),
+        .log_level = log_level,
         .arena = arena,
     };
+}
+
+pub fn parseLogLevel(s: []const u8) ?std.log.Level {
+    if (std.mem.eql(u8, s, "debug")) return .debug;
+    if (std.mem.eql(u8, s, "info")) return .info;
+    if (std.mem.eql(u8, s, "warn")) return .warn;
+    if (std.mem.eql(u8, s, "err") or std.mem.eql(u8, s, "error")) return .err;
+    return null;
 }
 
 fn splitCsv(a: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
@@ -76,4 +96,10 @@ test "splitCsv basic" {
     try std.testing.expectEqualStrings("b", out[1]);
     try std.testing.expectEqualStrings("c", out[2]);
     try std.testing.expectEqualStrings("d", out[3]);
+}
+
+test "parseLogLevel" {
+    try std.testing.expectEqual(@as(?std.log.Level, .debug), parseLogLevel("debug"));
+    try std.testing.expectEqual(@as(?std.log.Level, .err), parseLogLevel("error"));
+    try std.testing.expectEqual(@as(?std.log.Level, null), parseLogLevel("loud"));
 }

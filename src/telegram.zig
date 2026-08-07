@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
+const Io = std.Io;
 
 pub const Update = struct {
     update_id: i64,
@@ -21,6 +22,15 @@ pub const Chat = struct {
     id: i64,
 };
 
+pub const Error = error{
+    /// Bot token rejected — configuration problem, not weather.
+    TelegramUnauthorized,
+    /// Another getUpdates poller is running against the same token.
+    TelegramConflict,
+    TelegramHttpError,
+    TelegramApiError,
+};
+
 pub const Client = struct {
     http: *http.Client,
     allocator: std.mem.Allocator,
@@ -32,6 +42,14 @@ pub const Client = struct {
 
     fn methodUrl(self: *Client, allocator: std.mem.Allocator, method: []const u8) ![]u8 {
         return std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/{s}", .{ self.token, method });
+    }
+
+    fn statusToError(status: std.http.Status) Error {
+        return switch (status) {
+            .unauthorized => Error.TelegramUnauthorized,
+            .conflict => Error.TelegramConflict,
+            else => Error.TelegramHttpError,
+        };
     }
 
     pub const Updates = struct {
@@ -55,7 +73,8 @@ pub const Client = struct {
     pub fn getUpdates(self: *Client, offset: i64, timeout_sec: u32) !Updates {
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "https://api.telegram.org/bot{s}/getUpdates?offset={d}&timeout={d}&allowed_updates=[\"message\"]",
+            // %5B%22message%22%5D = ["message"], percent-encoded.
+            "https://api.telegram.org/bot{s}/getUpdates?offset={d}&timeout={d}&allowed_updates=%5B%22message%22%5D",
             .{ self.token, offset, timeout_sec },
         );
         defer self.allocator.free(url);
@@ -63,7 +82,11 @@ pub const Client = struct {
         var resp = try self.http.request(.{ .url = url, .method = .GET });
         defer resp.deinit();
 
-        if (resp.status != .ok) return error.TelegramHttpError;
+        if (resp.status != .ok) {
+            // Response bodies never contain the token; the URL does — log the former only.
+            std.log.warn("getUpdates status={d} body={s}", .{ @intFromEnum(resp.status), resp.body });
+            return statusToError(resp.status);
+        }
 
         const parsed = try std.json.parseFromSlice(
             Updates.Envelope,
@@ -72,13 +95,26 @@ pub const Client = struct {
             .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
         );
         if (!parsed.value.ok) {
+            std.log.warn("getUpdates api not-ok: {s}", .{parsed.value.description orelse "(no description)"});
             parsed.deinit();
-            return error.TelegramApiError;
+            return Error.TelegramApiError;
         }
         return .{ .parsed = parsed };
     }
 
     pub fn sendMessage(self: *Client, chat_id: i64, text: []const u8) !void {
+        var attempt: u2 = 0;
+        while (true) : (attempt += 1) {
+            const status = try self.sendMessageOnce(chat_id, text);
+            if (status == .ok) return;
+            // Honor flood-control once; anything else (or a second 429) is
+            // left to the caller, whose notified-ledger retries next cycle.
+            if (status == .too_many_requests and attempt == 0) continue;
+            return statusToError(status);
+        }
+    }
+
+    fn sendMessageOnce(self: *Client, chat_id: i64, text: []const u8) !std.http.Status {
         const url = try self.methodUrl(self.allocator, "sendMessage");
         defer self.allocator.free(url);
 
@@ -99,10 +135,14 @@ pub const Client = struct {
         });
         defer resp.deinit();
 
-        if (resp.status != .ok) {
+        if (resp.status == .too_many_requests) {
+            const wait_sec = parseRetryAfter(self.allocator, resp.body) orelse 3;
+            std.log.warn("sendMessage 429; waiting {d}s", .{wait_sec});
+            sleepSec(self.http.io, wait_sec);
+        } else if (resp.status != .ok) {
             std.log.warn("sendMessage status={d} body={s}", .{ @intFromEnum(resp.status), resp.body });
-            return error.TelegramHttpError;
         }
+        return resp.status;
     }
 
     pub const Command = struct {
@@ -132,10 +172,36 @@ pub const Client = struct {
             std.log.warn("setMyCommands status={d} body={s}", .{
                 @intFromEnum(resp.status), resp.body,
             });
-            return error.TelegramHttpError;
+            return statusToError(resp.status);
         }
     }
 };
+
+/// Extract parameters.retry_after from a Bot API error body, capped to 60s.
+pub fn parseRetryAfter(allocator: std.mem.Allocator, body: []const u8) ?u32 {
+    const Envelope = struct {
+        parameters: ?struct {
+            retry_after: ?u32 = null,
+        } = null,
+    };
+    const parsed = std.json.parseFromSlice(
+        Envelope,
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+    const params = parsed.value.parameters orelse return null;
+    const ra = params.retry_after orelse return null;
+    return @min(ra, 60);
+}
+
+fn sleepSec(io: Io, sec: u32) void {
+    Io.Clock.Duration.sleep(.{
+        .raw = .{ .nanoseconds = @as(i96, sec) * std.time.ns_per_s },
+        .clock = .awake,
+    }, io) catch {};
+}
 
 test "parse getUpdates envelope" {
     const a = std.testing.allocator;
@@ -156,4 +222,18 @@ test "parse getUpdates envelope" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.result.len);
     try std.testing.expectEqualStrings("/list", parsed.value.result[0].message.?.text.?);
     try std.testing.expectEqual(@as(i64, 99), parsed.value.result[1].message.?.from.?.id);
+}
+
+test "parseRetryAfter" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(
+        @as(?u32, 5),
+        parseRetryAfter(a, "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":5}}"),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 60),
+        parseRetryAfter(a, "{\"parameters\":{\"retry_after\":3600}}"),
+    );
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter(a, "{\"ok\":false}"));
+    try std.testing.expectEqual(@as(?u32, null), parseRetryAfter(a, "not json"));
 }

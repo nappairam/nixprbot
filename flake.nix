@@ -14,9 +14,14 @@
         default = nixprbot;
       });
 
+      checks = forAllSystems (pkgs: {
+        # doCheck in the package runs `zig build test`.
+        package = pkgs.callPackage ./nix/package.nix { };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ zig zls sqlite zon2nix ];
+          packages = with pkgs; [ zig_0_16 zls sqlite zon2nix ];
         };
       });
 

@@ -1,6 +1,10 @@
-.zig-cache/
 zig-out/
+.zig-cache/
+zig-cache/
 zig-pkg/
-*.sqlite
 result
 result-*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env

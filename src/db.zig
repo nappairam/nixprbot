@@ -9,12 +9,38 @@ pub const Db = struct {
         var conn = try zqlite.open(path, flags);
         errdefer conn.close();
         try conn.busyTimeout(5000);
+        try conn.execNoArgs("PRAGMA journal_mode=WAL");
+        try conn.execNoArgs("PRAGMA synchronous=NORMAL");
         try migrate(&conn);
         return .{ .conn = conn };
     }
 
     pub fn close(self: *Db) void {
         self.conn.close();
+    }
+
+    // ---- kv (offset, flags) ----
+
+    pub fn kvGetInt(self: *Db, key: []const u8) !?i64 {
+        const row_opt = try self.conn.row("SELECT v FROM kv WHERE k = ?1", .{key});
+        if (row_opt) |row| {
+            defer row.deinit();
+            return std.fmt.parseInt(i64, row.text(0), 10) catch null;
+        }
+        return null;
+    }
+
+    pub fn kvSetInt(self: *Db, key: []const u8, value: i64) !void {
+        var buf: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable;
+        try self.conn.exec(
+            \\INSERT INTO kv(k, v) VALUES(?1, ?2)
+            \\ON CONFLICT(k) DO UPDATE SET v = excluded.v
+        , .{ key, s });
+    }
+
+    pub fn kvDelete(self: *Db, key: []const u8) !void {
+        try self.conn.exec("DELETE FROM kv WHERE k = ?1", .{key});
     }
 
     // ---- subscriptions ----
@@ -48,29 +74,19 @@ pub const Db = struct {
         allocator: std.mem.Allocator,
         chat_id: i64,
     ) ![]i64 {
-        var rows = try self.conn.rows(
+        return self.intColumn(
+            allocator,
             "SELECT pr_number FROM subscriptions WHERE chat_id = ?1 ORDER BY pr_number",
             .{chat_id},
         );
-        defer rows.deinit();
-        var list: std.ArrayList(i64) = .empty;
-        errdefer list.deinit(allocator);
-        while (rows.next()) |row| try list.append(allocator, row.int(0));
-        if (rows.err) |err| return err;
-        return list.toOwnedSlice(allocator);
     }
 
     pub fn allTrackedPrs(self: *Db, allocator: std.mem.Allocator) ![]i64 {
-        var rows = try self.conn.rows(
+        return self.intColumn(
+            allocator,
             "SELECT DISTINCT pr_number FROM subscriptions ORDER BY pr_number",
             .{},
         );
-        defer rows.deinit();
-        var list: std.ArrayList(i64) = .empty;
-        errdefer list.deinit(allocator);
-        while (rows.next()) |row| try list.append(allocator, row.int(0));
-        if (rows.err) |err| return err;
-        return list.toOwnedSlice(allocator);
     }
 
     pub fn subscribers(
@@ -78,10 +94,29 @@ pub const Db = struct {
         allocator: std.mem.Allocator,
         pr_number: i64,
     ) ![]i64 {
-        var rows = try self.conn.rows(
+        return self.intColumn(
+            allocator,
             "SELECT chat_id FROM subscriptions WHERE pr_number = ?1",
             .{pr_number},
         );
+    }
+
+    /// Every chat with at least one subscription — the operator-alert audience.
+    pub fn allChats(self: *Db, allocator: std.mem.Allocator) ![]i64 {
+        return self.intColumn(
+            allocator,
+            "SELECT DISTINCT chat_id FROM subscriptions ORDER BY chat_id",
+            .{},
+        );
+    }
+
+    fn intColumn(
+        self: *Db,
+        allocator: std.mem.Allocator,
+        comptime sql: []const u8,
+        args: anytype,
+    ) ![]i64 {
+        var rows = try self.conn.rows(sql, args);
         defer rows.deinit();
         var list: std.ArrayList(i64) = .empty;
         errdefer list.deinit(allocator);
@@ -226,6 +261,12 @@ pub const Db = struct {
 
 fn migrate(conn: *zqlite.Conn) !void {
     try conn.execNoArgs(
+        \\CREATE TABLE IF NOT EXISTS kv (
+        \\    k TEXT PRIMARY KEY,
+        \\    v TEXT NOT NULL
+        \\) STRICT;
+    );
+    try conn.execNoArgs(
         \\CREATE TABLE IF NOT EXISTS subscriptions (
         \\    chat_id    INTEGER NOT NULL,
         \\    pr_number  INTEGER NOT NULL,
@@ -283,6 +324,10 @@ test "subscriptions and stages" {
     defer a.free(subs);
     try std.testing.expectEqual(@as(usize, 2), subs.len);
 
+    const chats = try db.allChats(a);
+    defer a.free(chats);
+    try std.testing.expectEqualSlices(i64, &.{ 42, 99 }, chats);
+
     try db.upsertMeta(100, "fix x", "open", false, null);
     var meta = (try db.getMeta(a, 100)).?;
     defer meta.deinit(a);
@@ -304,4 +349,17 @@ test "subscriptions and stages" {
     try std.testing.expect(!(try db.unsubscribe(42, 100)));
     // unsubscribe wipes notified rows for that (chat, pr) so re-track replays.
     try std.testing.expect(!(try db.alreadyNotified(42, 100, "master")));
+}
+
+test "kv roundtrip" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+
+    try std.testing.expectEqual(@as(?i64, null), try db.kvGetInt("tg_offset"));
+    try db.kvSetInt("tg_offset", 792841029);
+    try std.testing.expectEqual(@as(?i64, 792841029), try db.kvGetInt("tg_offset"));
+    try db.kvSetInt("tg_offset", 792841030);
+    try std.testing.expectEqual(@as(?i64, 792841030), try db.kvGetInt("tg_offset"));
+    try db.kvDelete("tg_offset");
+    try std.testing.expectEqual(@as(?i64, null), try db.kvGetInt("tg_offset"));
 }
