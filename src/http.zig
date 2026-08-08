@@ -75,7 +75,7 @@ pub const Client = struct {
         const result = self.inner.fetch(.{
             .location = .{ .url = opts.url },
             .method = opts.method,
-            .payload = opts.body,
+            .payload = normalizePayload(opts.method, opts.body),
             .extra_headers = opts.headers,
             .response_writer = &alloc_w.writer,
         }) catch |err| {
@@ -95,3 +95,26 @@ pub const Client = struct {
         };
     }
 };
+
+/// std.http.Client's send path asserts — a panic in ReleaseSafe — when a
+/// body-carrying method arrives with a null payload (fetch calls
+/// sendBodiless, which requires !method.requestHasBody()). Normalize to an
+/// empty body so callers can't trip it. Took the bot down in production:
+/// a bodiless heartbeat POST crash-looped the process on every first beat.
+fn normalizePayload(method: ?Method, body: ?[]const u8) ?[]const u8 {
+    if (body != null) return body;
+    return switch (method orelse .GET) {
+        .POST, .PUT, .PATCH => "",
+        else => null,
+    };
+}
+
+test "normalizePayload gives body-carrying methods an empty body" {
+    try std.testing.expectEqualStrings("", normalizePayload(.POST, null).?);
+    try std.testing.expectEqualStrings("", normalizePayload(.PUT, null).?);
+    try std.testing.expectEqualStrings("", normalizePayload(.PATCH, null).?);
+    try std.testing.expect(normalizePayload(.GET, null) == null);
+    try std.testing.expect(normalizePayload(null, null) == null);
+    try std.testing.expectEqualStrings("x", normalizePayload(.POST, "x").?);
+    try std.testing.expectEqualStrings("x", normalizePayload(.GET, "x").?);
+}
