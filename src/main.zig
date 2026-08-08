@@ -216,6 +216,11 @@ pub fn main(init: std.process.Init) !void {
     var tg_backoff = backoff_mod.Backoff.init(nowSeedNs(), std.time.ns_per_s, 60 * std.time.ns_per_s);
     var github_paused_ns: i96 = 0;
     var rate_limit_streak: u32 = 0;
+    // Heartbeat state: while degraded_reason is set the bot reports a labeled
+    // failure instead of beating. One dirty sweep is forgiven (GitHub weather
+    // self-heals next sweep); two in a row is a condition worth an incident.
+    var dirty_sweeps: u32 = 0;
+    var degraded_reason: ?[]const u8 = null;
 
     while (!runtime.shutdown.load(.seq_cst)) {
         notify.ping();
@@ -229,6 +234,13 @@ pub fn main(init: std.process.Init) !void {
             if (tracker.runOnce()) {
                 github_paused_ns = 0;
                 rate_limit_streak = 0;
+                if (tracker.sweep_clean) {
+                    dirty_sweeps = 0;
+                    degraded_reason = null;
+                } else {
+                    dirty_sweeps += 1;
+                    if (dirty_sweeps >= 2) degraded_reason = "consecutive sweeps had failures; see journal";
+                }
                 // A sweep with zero tracked PRs makes no GitHub call, so it
                 // proves nothing about auth; verify before announcing
                 // recovery. /rate_limit is quota-free.
@@ -238,23 +250,31 @@ pub fn main(init: std.process.Init) !void {
                         alertGithubAuth(gpa, &db, &tg, false);
                     } else |_| {}
                 }
-            } else |err| switch (err) {
-                error.GithubUnauthorized => {
-                    std.log.err("github auth failed; pausing tracking for {d}s", .{github_unauthorized_pause_sec});
-                    github_paused_ns = @max(0, @as(i96, github_unauthorized_pause_sec) * std.time.ns_per_s - interval_ns);
-                    tracker.gh_pause = .unauthorized;
-                    alertGithubAuth(gpa, &db, &tg, true);
-                },
-                error.GithubRateLimited => {
-                    std.log.warn("github rate limited; pausing tracking for {d}s", .{github_ratelimit_pause_sec});
-                    github_paused_ns = @max(0, @as(i96, github_ratelimit_pause_sec) * std.time.ns_per_s - interval_ns);
-                    tracker.gh_pause = .rate_limited;
-                    rate_limit_streak += 1;
-                    if (rate_limit_streak == max_consecutive_rate_limits) {
-                        _ = broadcast(gpa, &db, &tg, ratelimit_stuck_text);
-                    }
-                },
-                else => std.log.warn("status poll failed: {s}", .{@errorName(err)}),
+            } else |err| {
+                dirty_sweeps += 1;
+                switch (err) {
+                    error.GithubUnauthorized => {
+                        std.log.err("github auth failed; pausing tracking for {d}s", .{github_unauthorized_pause_sec});
+                        github_paused_ns = @max(0, @as(i96, github_unauthorized_pause_sec) * std.time.ns_per_s - interval_ns);
+                        tracker.gh_pause = .unauthorized;
+                        degraded_reason = "github token rejected (401); tracking paused";
+                        alertGithubAuth(gpa, &db, &tg, true);
+                    },
+                    error.GithubRateLimited => {
+                        std.log.warn("github rate limited; pausing tracking for {d}s", .{github_ratelimit_pause_sec});
+                        github_paused_ns = @max(0, @as(i96, github_ratelimit_pause_sec) * std.time.ns_per_s - interval_ns);
+                        tracker.gh_pause = .rate_limited;
+                        degraded_reason = "github rate limited; tracking paused";
+                        rate_limit_streak += 1;
+                        if (rate_limit_streak == max_consecutive_rate_limits) {
+                            _ = broadcast(gpa, &db, &tg, ratelimit_stuck_text);
+                        }
+                    },
+                    else => {
+                        std.log.warn("status poll failed: {s}", .{@errorName(err)});
+                        if (dirty_sweeps >= 2) degraded_reason = "consecutive sweeps failed; see journal";
+                    },
+                }
             }
             last_status_poll = Io.Clock.Timestamp.now(io, .awake);
         }
@@ -271,12 +291,14 @@ pub fn main(init: std.process.Init) !void {
             switch (err) {
                 error.TelegramUnauthorized => {
                     std.log.err("bot token rejected; exiting", .{});
+                    hb.fail("telegram bot token rejected; exiting");
                     std.process.exit(1);
                 },
                 error.TelegramConflict => {
                     // Another poller owns this token (stale deploy overlap?).
                     // Exit and let systemd's restart backoff arbitrate.
                     std.log.err("getUpdates conflict: another poller is active; exiting", .{});
+                    hb.fail("telegram getUpdates conflict: another poller is active; exiting");
                     std.process.exit(1);
                 },
                 else => {},
@@ -286,8 +308,12 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("getUpdates failed {d} times in a row ({s}); exiting for a fresh start", .{
                     tg_failures, @errorName(err),
                 });
+                hb.fail("telegram failure budget exhausted; exiting for restart");
                 std.process.exit(1);
             }
+            // hc-ping.com is a different host than api.telegram.org, so a
+            // labeled fail often still gets out while Telegram is unreachable.
+            if (tg_failures >= 5) hb.fail("telegram polling failing; see journal");
             const delay = tg_backoff.next();
             std.log.warn("getUpdates failed ({s}); retry {d}/{d} in {d}ms", .{
                 @errorName(err), tg_failures, max_consecutive_tg_failures, delay / std.time.ns_per_ms,
@@ -316,11 +342,11 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        // Dead-man ping, gated on full functionality: this poll succeeded
-        // AND the last sweep (runOnce sets sweep_clean, and an aborted or
-        // erroring sweep leaves it false) had no contained failures. Silence
-        // at the receiver is the alert.
-        if (tracker.sweep_clean) hb.beat();
+        // Dead-man signal: healthy (this poll succeeded, sweeps clean) beats;
+        // a known degradation reports itself with a label so the incident
+        // names its cause. Unlabeled silence remains the signature of the
+        // failures the bot can't see coming (crash loop, hang, box death).
+        if (degraded_reason) |reason| hb.fail(reason) else hb.beat();
     }
     std.log.info("shutdown signal received; exiting cleanly", .{});
     notify.stopping();

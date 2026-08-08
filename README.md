@@ -30,6 +30,7 @@ runtime dependencies. Single static-ish binary.
 | `NIXPRBOT_BRANCHES` | `staging-next,master,nixpkgs-unstable,nixos-unstable-small,nixos-unstable` | |
 | `NIXPRBOT_REPO` | `NixOS/nixpkgs` | |
 | `NIXPRBOT_LOG` | `info` | `debug`/`info`/`warn`/`err` |
+| `NIXPRBOT_HEARTBEAT_URL` | unset | Dead-man ping URL (healthchecks.io / Better Stack); secret — the token is in the URL |
 
 ## Failure policy
 
@@ -46,6 +47,11 @@ runtime dependencies. Single static-ish binary.
   keep working while tracking is paused.
 - The Telegram `getUpdates` offset is persisted in SQLite, so restarts neither
   drop nor replay commands.
+- With `NIXPRBOT_HEARTBEAT_URL` set, the bot pings the URL while fully
+  functional (Telegram polling up, last sweep clean) and POSTs `<url>/fail`
+  with a reason when it knows it's degraded (GitHub 401/rate-limit, repeated
+  sweep failures, Telegram failure streaks, pre-exit). Labeled incidents for
+  what it can see; unlabeled silence means crash/hang/box-down.
 - Notifications are sent before being marked, never after — a failed send
   retries next sweep (at-least-once).
 
