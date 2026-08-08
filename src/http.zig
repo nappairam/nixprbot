@@ -49,6 +49,19 @@ pub const Client = struct {
     };
 
     pub fn request(self: *Client, opts: RequestOptions) !Response {
+        return self.requestOnce(opts) catch |err| switch (err) {
+            // A pooled keep-alive connection the server closed during idle
+            // surfaces as a clean EOF the moment it's reused — the request
+            // was never processed, so one retry (requestOnce already reset
+            // the client, giving a fresh connection) is safe even for POSTs.
+            // Every other error stays fatal to the attempt: retrying a
+            // half-written request could double-send.
+            error.HttpConnectionClosing => self.requestOnce(opts),
+            else => err,
+        };
+    }
+
+    fn requestOnce(self: *Client, opts: RequestOptions) !Response {
         // std.http.Client freezes `now` on first TLS handshake and reuses it
         // for every subsequent cert validity check. After the upstream rotates
         // its certificate, the new `notBefore` may be later than that frozen
