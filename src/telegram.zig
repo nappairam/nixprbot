@@ -28,6 +28,8 @@ pub const Error = error{
     TelegramUnauthorized,
     /// Another getUpdates poller is running against the same token.
     TelegramConflict,
+    /// The chat blocked the bot (or kicked it) — permanent per-chat.
+    TelegramForbidden,
     TelegramHttpError,
     TelegramApiError,
 };
@@ -49,6 +51,7 @@ pub const Client = struct {
         return switch (status) {
             .unauthorized => Error.TelegramUnauthorized,
             .conflict => Error.TelegramConflict,
+            .forbidden => Error.TelegramForbidden,
             else => Error.TelegramHttpError,
         };
     }

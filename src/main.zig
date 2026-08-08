@@ -9,6 +9,7 @@ const commands = @import("commands.zig");
 const tracker_mod = @import("tracker.zig");
 const backoff_mod = @import("backoff.zig");
 const notify_mod = @import("notify.zig");
+const heartbeat_mod = @import("heartbeat.zig");
 const runtime = @import("runtime.zig");
 
 pub const std_options: std.Options = .{
@@ -171,6 +172,7 @@ pub fn main(init: std.process.Init) !void {
     var tg = telegram.Client.init(gpa, &http_client, cfg.bot_token);
     var gh = github.Client.init(gpa, &http_client, cfg.github_token, cfg.repo);
     var tracker = tracker_mod.Tracker.init(gpa, &db, &gh, &tg, cfg.branches, &notify);
+    var hb = heartbeat_mod.Heartbeat.init(&http_client, cfg.heartbeat_url);
 
     installSignalHandlers();
     runtime.notify = &notify;
@@ -178,8 +180,8 @@ pub fn main(init: std.process.Init) !void {
     // READY before any network call: setMyCommands/checkAuth have no request
     // timeout, and under Type=notify a startup stall would flap the unit via
     // TimeoutStartSec. Once READY is sent, the watchdog owns hang detection.
-    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d}", .{
-        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len,
+    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d} heartbeat={}", .{
+        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len, hb.enabled(),
     });
     notify.ready();
     notify.ping();
@@ -313,6 +315,12 @@ pub fn main(init: std.process.Init) !void {
                 std.log.warn("persist offset: {s}", .{@errorName(err)});
             };
         }
+
+        // Dead-man ping, gated on full functionality: this poll succeeded
+        // AND the last sweep (runOnce sets sweep_clean, and an aborted or
+        // erroring sweep leaves it false) had no contained failures. Silence
+        // at the receiver is the alert.
+        if (tracker.sweep_clean) hb.beat();
     }
     std.log.info("shutdown signal received; exiting cleanly", .{});
     notify.stopping();

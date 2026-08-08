@@ -8,9 +8,11 @@ pub const commands = @import("commands.zig");
 pub const backoff = @import("backoff.zig");
 pub const notify = @import("notify.zig");
 pub const runtime = @import("runtime.zig");
+pub const heartbeat = @import("heartbeat.zig");
 
 test {
     _ = runtime;
+    _ = heartbeat;
     _ = config;
     _ = db;
     _ = http;

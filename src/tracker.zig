@@ -31,6 +31,10 @@ pub const Tracker = struct {
     branches: []const []const u8,
     notify: *Notify,
     gh_pause: GhPause = .none,
+    /// True while the last runOnce saw no contained failures — GitHub calls,
+    /// notification sends, prunes all succeeded. Consumed by the heartbeat:
+    /// a dirty sweep must stop the dead-man pings.
+    sweep_clean: bool = true,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -166,9 +170,18 @@ pub const Tracker = struct {
         };
         if (seen) return true;
         self.tg.sendMessage(chat_id, text) catch |err| {
+            // A blocked bot can never deliver to this chat again; dropping
+            // the subscription is the honest outcome, and it must not hold
+            // the event's persistence (or the heartbeat) hostage.
+            if (err == error.TelegramForbidden) {
+                std.log.info("chat {d} blocked the bot; unsubscribing from pr {d}", .{ chat_id, pr_number });
+                _ = self.db.unsubscribe(chat_id, pr_number) catch {};
+                return true;
+            }
             std.log.warn("notify chat={d} pr={d} stage={s}: {s}", .{
                 chat_id, pr_number, stage, @errorName(err),
             });
+            self.sweep_clean = false;
             return false;
         };
         self.db.markNotified(chat_id, pr_number, stage) catch |err| {
@@ -227,25 +240,35 @@ pub const Tracker = struct {
     /// GithubUnauthorized/GithubRateLimited abort the sweep and propagate so
     /// the main loop can pause GitHub polling instead of hammering.
     pub fn runOnce(self: *Tracker) !void {
+        // Pessimistic until the sweep is underway: an abort at any point must
+        // leave the flag false, never a stale true from the previous sweep.
+        self.sweep_clean = false;
         const prs = try self.db.allTrackedPrs(self.allocator);
         defer self.allocator.free(prs);
         std.log.info("tracker.runOnce prs={d}", .{prs.len});
+        self.sweep_clean = true;
         for (prs) |pr_number| {
             if (runtime.shutdown.load(.seq_cst)) return;
             self.notify.ping();
             const ok = self.refreshPr(pr_number) catch |err| switch (err) {
-                error.GithubUnauthorized, error.GithubRateLimited => return err,
+                error.GithubUnauthorized, error.GithubRateLimited => {
+                    self.sweep_clean = false;
+                    return err;
+                },
                 else => blk: {
                     std.log.warn("refreshPr {d}: {s}", .{ pr_number, @errorName(err) });
+                    self.sweep_clean = false;
                     break :blk false;
                 },
             };
             if (!ok) continue;
             _ = self.pruneIfComplete(pr_number) catch |err| {
                 std.log.warn("pruneIfComplete {d}: {s}", .{ pr_number, @errorName(err) });
+                self.sweep_clean = false;
             };
             _ = self.pruneIfClosed(pr_number) catch |err| {
                 std.log.warn("pruneIfClosed {d}: {s}", .{ pr_number, @errorName(err) });
+                self.sweep_clean = false;
             };
         }
     }
@@ -309,11 +332,17 @@ pub const Tracker = struct {
             // Message strictly before unsubscribe: a failed send keeps the
             // subscription (and the notified ledger) so next sweep retries —
             // a tracked PR must never vanish without the chat hearing why.
+            // Exception: a chat that blocked the bot can never hear anything;
+            // fall through and unsubscribe it.
             self.tg.sendMessage(chat_id, text) catch |err| {
-                std.log.warn("untrack notify chat={d} pr={d}: {s}", .{
-                    chat_id, pr_number, @errorName(err),
-                });
-                continue;
+                if (err != error.TelegramForbidden) {
+                    std.log.warn("untrack notify chat={d} pr={d}: {s}", .{
+                        chat_id, pr_number, @errorName(err),
+                    });
+                    self.sweep_clean = false;
+                    continue;
+                }
+                std.log.info("chat {d} blocked the bot; unsubscribing from pr {d}", .{ chat_id, pr_number });
             };
             _ = self.db.unsubscribe(chat_id, pr_number) catch |err| {
                 std.log.warn("auto-untrack chat={d} pr={d}: {s}", .{
