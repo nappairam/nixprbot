@@ -3,6 +3,11 @@ const Db = @import("db.zig").Db;
 const TelegramClient = @import("telegram.zig").Client;
 const github = @import("github.zig");
 const Notify = @import("notify.zig").Notify;
+const runtime = @import("runtime.zig");
+
+/// Set by the main loop while GitHub polling is paused; refreshPr fails fast
+/// so user commands can't hammer a rate-limited (or auth-broken) API.
+pub const GhPause = enum { none, rate_limited, unauthorized };
 
 pub const Event = union(enum) {
     merged,
@@ -25,6 +30,7 @@ pub const Tracker = struct {
     tg: *TelegramClient,
     branches: []const []const u8,
     notify: *Notify,
+    gh_pause: GhPause = .none,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -51,6 +57,12 @@ pub const Tracker = struct {
     /// GithubUnauthorized and GithubRateLimited propagate — they poison the
     /// whole sweep, not just this PR, and the caller must stop.
     pub fn refreshPr(self: *Tracker, pr_number: i64) !bool {
+        switch (self.gh_pause) {
+            .none => {},
+            .rate_limited => return error.GithubRateLimited,
+            .unauthorized => return error.GithubUnauthorized,
+        }
+
         std.log.debug("refreshPr {d}", .{pr_number});
         var pr_parsed = self.gh.getPr(pr_number) catch |err| switch (err) {
             error.GithubNotFound => {
@@ -67,16 +79,23 @@ pub const Tracker = struct {
         const prev_merged = if (prev) |p| p.merged else false;
         const prev_state: ?[]const u8 = if (prev) |p| p.state else null;
 
-        try self.db.upsertMeta(pr_number, pr.title, pr.state, pr.merged, pr.merge_commit_sha);
         std.log.debug("PR #{d} state={s} merged={} prev_merged={} prev_state={?s}", .{
             pr_number, pr.state, pr.merged, prev_merged, prev_state,
         });
 
+        // Events fire BEFORE the state they are edged on is persisted, and
+        // the state is only persisted once every subscriber got the message.
+        // A failed send therefore re-fires next sweep (the notified ledger
+        // dedups chats that already got it) instead of being lost forever.
+        var events_ok = true;
         if (pr.merged and !prev_merged) {
-            try self.fanout(pr, .merged);
+            events_ok = try self.fanout(pr, .merged);
         } else if (std.mem.eql(u8, pr.state, "closed") and !pr.merged) {
             const was_closed = if (prev_state) |s| std.mem.eql(u8, s, "closed") else false;
-            if (!was_closed) try self.fanout(pr, .closed);
+            if (!was_closed) events_ok = try self.fanout(pr, .closed);
+        }
+        if (events_ok) {
+            try self.db.upsertMeta(pr_number, pr.title, pr.state, pr.merged, pr.merge_commit_sha);
         }
 
         if (pr.merged) {
@@ -100,53 +119,62 @@ pub const Tracker = struct {
                 };
                 std.log.debug("  {s}: contains={}", .{ branch, in_branch });
                 if (!in_branch) continue;
-                const newly = try self.db.recordStage(pr_number, branch);
-                if (newly) try self.fanout(pr, .{ .stage = branch });
+                if (try self.fanout(pr, .{ .stage = branch })) {
+                    _ = try self.db.recordStage(pr_number, branch);
+                }
             }
         }
 
         return true;
     }
 
-    fn fanout(self: *Tracker, pr: github.Pr, event: Event) !void {
+    /// Returns true when every subscriber is marked notified (sent now or
+    /// previously); false when at least one send failed and the event must
+    /// re-fire next sweep.
+    fn fanout(self: *Tracker, pr: github.Pr, event: Event) !bool {
         const subs = try self.db.subscribers(self.allocator, pr.number);
         defer self.allocator.free(subs);
 
         const stage = stageKey(event);
         std.log.info("fanout pr={d} stage={s} subs={d}", .{ pr.number, stage, subs.len });
-        if (subs.len == 0) return;
+        if (subs.len == 0) return true;
 
         const text = try formatEvent(self.allocator, pr.number, pr.title, pr.html_url, event);
         defer self.allocator.free(text);
 
+        var all_ok = true;
         for (subs) |chat_id| {
-            try self.sendIfNew(chat_id, pr.number, stage, text);
+            if (!try self.sendIfNew(chat_id, pr.number, stage, text)) all_ok = false;
         }
+        return all_ok;
     }
 
     /// Send-then-mark: a failed send stays unmarked and retries next cycle.
-    /// At-least-once beats silently-never.
+    /// At-least-once beats silently-never. Returns true when the chat is
+    /// marked notified (now or previously).
     fn sendIfNew(
         self: *Tracker,
         chat_id: i64,
         pr_number: i64,
         stage: []const u8,
         text: []const u8,
-    ) !void {
+    ) !bool {
+        self.notify.ping();
         const seen = self.db.alreadyNotified(chat_id, pr_number, stage) catch |err| {
             std.log.warn("alreadyNotified chat={d} pr={d}: {s}", .{ chat_id, pr_number, @errorName(err) });
-            return;
+            return false;
         };
-        if (seen) return;
+        if (seen) return true;
         self.tg.sendMessage(chat_id, text) catch |err| {
             std.log.warn("notify chat={d} pr={d} stage={s}: {s}", .{
                 chat_id, pr_number, stage, @errorName(err),
             });
-            return;
+            return false;
         };
         self.db.markNotified(chat_id, pr_number, stage) catch |err| {
             std.log.warn("markNotified chat={d} pr={d}: {s}", .{ chat_id, pr_number, @errorName(err) });
         };
+        return true;
     }
 
     /// Send one message per stage already reached for the PR (and merged/closed
@@ -173,12 +201,12 @@ pub const Tracker = struct {
         if (m.merged) {
             const text = try formatEvent(self.allocator, pr_number, title, html_url, .merged);
             defer self.allocator.free(text);
-            try self.sendIfNew(chat_id, pr_number, "_merged", text);
+            _ = try self.sendIfNew(chat_id, pr_number, "_merged", text);
         } else if (m.state) |s| {
             if (std.mem.eql(u8, s, "closed")) {
                 const text = try formatEvent(self.allocator, pr_number, title, html_url, .closed);
                 defer self.allocator.free(text);
-                try self.sendIfNew(chat_id, pr_number, "_closed", text);
+                _ = try self.sendIfNew(chat_id, pr_number, "_closed", text);
             }
         }
 
@@ -191,7 +219,7 @@ pub const Tracker = struct {
             if (!containsBranch(reached, b)) continue;
             const text = try formatEvent(self.allocator, pr_number, title, html_url, .{ .stage = b });
             defer self.allocator.free(text);
-            try self.sendIfNew(chat_id, pr_number, b, text);
+            _ = try self.sendIfNew(chat_id, pr_number, b, text);
         }
     }
 
@@ -203,6 +231,7 @@ pub const Tracker = struct {
         defer self.allocator.free(prs);
         std.log.info("tracker.runOnce prs={d}", .{prs.len});
         for (prs) |pr_number| {
+            if (runtime.shutdown.load(.seq_cst)) return;
             self.notify.ping();
             const ok = self.refreshPr(pr_number) catch |err| switch (err) {
                 error.GithubUnauthorized, error.GithubRateLimited => return err,
@@ -274,23 +303,28 @@ pub const Tracker = struct {
         defer self.allocator.free(subs);
         if (subs.len == 0) return 0;
 
+        var removed: usize = 0;
         for (subs) |chat_id| {
-            // Message before unsubscribe: unsubscribe wipes the notified
-            // ledger, and a crash in between only risks a duplicate, never
-            // a silent removal.
+            self.notify.ping();
+            // Message strictly before unsubscribe: a failed send keeps the
+            // subscription (and the notified ledger) so next sweep retries —
+            // a tracked PR must never vanish without the chat hearing why.
             self.tg.sendMessage(chat_id, text) catch |err| {
                 std.log.warn("untrack notify chat={d} pr={d}: {s}", .{
                     chat_id, pr_number, @errorName(err),
                 });
+                continue;
             };
             _ = self.db.unsubscribe(chat_id, pr_number) catch |err| {
                 std.log.warn("auto-untrack chat={d} pr={d}: {s}", .{
                     chat_id, pr_number, @errorName(err),
                 });
+                continue;
             };
+            removed += 1;
         }
-        std.log.info("auto-untracked PR #{d} ({d} sub(s))", .{ pr_number, subs.len });
-        return subs.len;
+        std.log.info("auto-untracked PR #{d} ({d}/{d} sub(s))", .{ pr_number, removed, subs.len });
+        return removed;
     }
 };
 

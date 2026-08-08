@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
+const runtime = @import("runtime.zig");
 const Io = std.Io;
 
 pub const Update = struct {
@@ -105,16 +106,26 @@ pub const Client = struct {
     pub fn sendMessage(self: *Client, chat_id: i64, text: []const u8) !void {
         var attempt: u2 = 0;
         while (true) : (attempt += 1) {
-            const status = try self.sendMessageOnce(chat_id, text);
-            if (status == .ok) return;
-            // Honor flood-control once; anything else (or a second 429) is
+            const res = try self.sendMessageOnce(chat_id, text);
+            if (res.status == .ok) return;
+            // Honor flood-control once; a second 429 (or anything else) is
             // left to the caller, whose notified-ledger retries next cycle.
-            if (status == .too_many_requests and attempt == 0) continue;
-            return statusToError(status);
+            if (res.status == .too_many_requests and attempt == 0) {
+                const wait_sec = res.retry_after orelse 3;
+                std.log.warn("sendMessage 429; waiting {d}s", .{wait_sec});
+                runtime.sleepInterruptible(self.http.io, @as(u64, wait_sec) * std.time.ns_per_s);
+                continue;
+            }
+            return statusToError(res.status);
         }
     }
 
-    fn sendMessageOnce(self: *Client, chat_id: i64, text: []const u8) !std.http.Status {
+    const SendResult = struct {
+        status: std.http.Status,
+        retry_after: ?u32 = null,
+    };
+
+    fn sendMessageOnce(self: *Client, chat_id: i64, text: []const u8) !SendResult {
         const url = try self.methodUrl(self.allocator, "sendMessage");
         defer self.allocator.free(url);
 
@@ -136,13 +147,15 @@ pub const Client = struct {
         defer resp.deinit();
 
         if (resp.status == .too_many_requests) {
-            const wait_sec = parseRetryAfter(self.allocator, resp.body) orelse 3;
-            std.log.warn("sendMessage 429; waiting {d}s", .{wait_sec});
-            sleepSec(self.http.io, wait_sec);
-        } else if (resp.status != .ok) {
+            return .{
+                .status = resp.status,
+                .retry_after = parseRetryAfter(self.allocator, resp.body),
+            };
+        }
+        if (resp.status != .ok) {
             std.log.warn("sendMessage status={d} body={s}", .{ @intFromEnum(resp.status), resp.body });
         }
-        return resp.status;
+        return .{ .status = resp.status };
     }
 
     pub const Command = struct {
@@ -194,13 +207,6 @@ pub fn parseRetryAfter(allocator: std.mem.Allocator, body: []const u8) ?u32 {
     const params = parsed.value.parameters orelse return null;
     const ra = params.retry_after orelse return null;
     return @min(ra, 60);
-}
-
-fn sleepSec(io: Io, sec: u32) void {
-    Io.Clock.Duration.sleep(.{
-        .raw = .{ .nanoseconds = @as(i96, sec) * std.time.ns_per_s },
-        .clock = .awake,
-    }, io) catch {};
 }
 
 test "parse getUpdates envelope" {

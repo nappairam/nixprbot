@@ -204,9 +204,15 @@ fn handleList(
         return;
     }
 
+    // Telegram caps messages at 4096 chars; flush in chunks well below it so
+    // a chat tracking dozens of PRs still gets its list.
+    const flush_at = 3500;
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
     try buf.writer.writeAll("<b>Tracked PRs</b>");
+
+    var entry: std.Io.Writer.Allocating = .init(allocator);
+    defer entry.deinit();
     for (prs) |pr_number| {
         const meta = try db.getMeta(allocator, pr_number);
         defer if (meta) |m| m.deinit(allocator);
@@ -221,18 +227,25 @@ fn handleList(
             }
             break :blk "unknown";
         };
-        try buf.writer.print(
+        entry.clearRetainingCapacity();
+        try entry.writer.print(
             "\n• <a href=\"https://github.com/{s}/pull/{d}\">#{d}</a> [<code>{s}</code>] ",
             .{ repo, pr_number, pr_number, state_label },
         );
-        try writeEscaped(&buf.writer, title_raw);
+        try writeEscaped(&entry.writer, title_raw);
         if (reached.len > 0) {
-            try buf.writer.writeAll("\n   stages: ");
+            try entry.writer.writeAll("\n   stages: ");
             for (reached, 0..) |s, k| {
-                if (k > 0) try buf.writer.writeAll(", ");
-                try buf.writer.writeAll(s);
+                if (k > 0) try entry.writer.writeAll(", ");
+                try entry.writer.writeAll(s);
             }
         }
+
+        if (buf.written().len + entry.written().len > flush_at) {
+            try tg.sendMessage(chat_id, buf.written());
+            buf.clearRetainingCapacity();
+        }
+        try buf.writer.writeAll(entry.written());
     }
     try tg.sendMessage(chat_id, buf.written());
 }

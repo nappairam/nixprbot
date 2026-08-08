@@ -7,8 +7,10 @@ pub const tracker = @import("tracker.zig");
 pub const commands = @import("commands.zig");
 pub const backoff = @import("backoff.zig");
 pub const notify = @import("notify.zig");
+pub const runtime = @import("runtime.zig");
 
 test {
+    _ = runtime;
     _ = config;
     _ = db;
     _ = http;

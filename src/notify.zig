@@ -21,7 +21,9 @@ pub const Notify = struct {
         var watchdog_ns: ?u64 = null;
         if (watchdog_usec) |s| {
             if (std.fmt.parseInt(u64, s, 10)) |usec| {
-                watchdog_ns = usec * std.time.ns_per_us;
+                if (usec > 0 and usec <= std.math.maxInt(u64) / std.time.ns_per_us) {
+                    watchdog_ns = usec * std.time.ns_per_us;
+                }
             } else |_| {}
         }
 

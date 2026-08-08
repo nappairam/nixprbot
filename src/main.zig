@@ -9,6 +9,7 @@ const commands = @import("commands.zig");
 const tracker_mod = @import("tracker.zig");
 const backoff_mod = @import("backoff.zig");
 const notify_mod = @import("notify.zig");
+const runtime = @import("runtime.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -16,8 +17,6 @@ pub const std_options: std.Options = .{
 };
 
 var runtime_log_level: std.log.Level = .info;
-
-var shutdown_flag: std.atomic.Value(bool) = .init(false);
 
 // Crash-only failure policy: the process never tries to out-clever a broken
 // transport. Consecutive Telegram poll failures exhaust a budget and the
@@ -27,12 +26,21 @@ var shutdown_flag: std.atomic.Value(bool) = .init(false);
 const max_consecutive_tg_failures = 15;
 const github_unauthorized_pause_sec = 3600;
 const github_ratelimit_pause_sec = 900;
+// A rate limit that survives this many consecutive sweeps is not weather —
+// it's a suspended token or similar. Say so in-chat.
+const max_consecutive_rate_limits = 4;
 
 const offset_key = "tg_offset";
 const auth_alert_key = "gh_auth_alerted";
 
+const auth_broken_text =
+    "⚠️ GitHub rejected the bot's token. PR tracking is paused; commands still work. Fix NIXPRBOT_GITHUB_TOKEN and the bot will recover on its own.";
+const auth_restored_text = "✅ GitHub auth restored; PR tracking resumed.";
+const ratelimit_stuck_text =
+    "⚠️ GitHub has been rate-limiting the bot for over an hour. If this persists, the token or account may be restricted.";
+
 fn shutdownHandler(_: std.posix.SIG) callconv(.c) void {
-    shutdown_flag.store(true, .seq_cst);
+    runtime.shutdown.store(true, .seq_cst);
 }
 
 fn installSignalHandlers() void {
@@ -101,36 +109,37 @@ fn nowSeedNs() u64 {
     return @as(u64, @bitCast(@as(i64, ts.sec) *% std.time.ns_per_s +% ts.nsec));
 }
 
-fn sleepNs(io: Io, ns: u64) void {
-    Io.Clock.Duration.sleep(.{
-        .raw = .{ .nanoseconds = @intCast(ns) },
-        .clock = .awake,
-    }, io) catch {};
+/// Broadcast to every subscribed chat. Returns true when every send worked
+/// (vacuously true with no subscribers).
+fn broadcast(gpa: std.mem.Allocator, db: *db_mod.Db, tg: *telegram.Client, text: []const u8) bool {
+    const chats = db.allChats(gpa) catch |err| {
+        std.log.warn("broadcast: allChats failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    defer gpa.free(chats);
+    var all_ok = true;
+    for (chats) |chat_id| {
+        runtime.ping();
+        tg.sendMessage(chat_id, text) catch |err| {
+            std.log.warn("broadcast chat={d}: {s}", .{ chat_id, @errorName(err) });
+            all_ok = false;
+        };
+    }
+    return all_ok;
 }
 
 /// Tell every subscribed chat that GitHub auth is broken (once per episode)
 /// or restored. The bot must never fail silently the way its python
 /// predecessor did — 401 for five days straight, visible only in journald.
+/// The once-per-episode flag is only set when delivery succeeded, so a
+/// failed alert retries on the next pause expiry.
 fn alertGithubAuth(gpa: std.mem.Allocator, db: *db_mod.Db, tg: *telegram.Client, broken: bool) void {
     const already = (db.kvGetInt(auth_alert_key) catch null) orelse 0;
     if (broken and already != 0) return;
     if (!broken and already == 0) return;
 
-    const text = if (broken)
-        "⚠️ GitHub rejected the bot's token (401). PR tracking is paused; commands still work. Fix NIXPRBOT_GITHUB_TOKEN and the bot will recover on its own."
-    else
-        "✅ GitHub auth restored; PR tracking resumed.";
-
-    const chats = db.allChats(gpa) catch |err| {
-        std.log.warn("auth alert: allChats failed: {s}", .{@errorName(err)});
-        return;
-    };
-    defer gpa.free(chats);
-    for (chats) |chat_id| {
-        tg.sendMessage(chat_id, text) catch |err| {
-            std.log.warn("auth alert chat={d}: {s}", .{ chat_id, @errorName(err) });
-        };
-    }
+    const delivered = broadcast(gpa, db, tg, if (broken) auth_broken_text else auth_restored_text);
+    if (!delivered) return;
 
     if (broken) {
         db.kvSetInt(auth_alert_key, 1) catch {};
@@ -164,6 +173,16 @@ pub fn main(init: std.process.Init) !void {
     var tracker = tracker_mod.Tracker.init(gpa, &db, &gh, &tg, cfg.branches, &notify);
 
     installSignalHandlers();
+    runtime.notify = &notify;
+
+    // READY before any network call: setMyCommands/checkAuth have no request
+    // timeout, and under Type=notify a startup stall would flap the unit via
+    // TimeoutStartSec. Once READY is sent, the watchdog owns hang detection.
+    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d}", .{
+        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len,
+    });
+    notify.ready();
+    notify.ping();
 
     tg.setMyCommands(&.{
         .{ .command = "track", .description = "Track a PR (e.g. /track 312345)" },
@@ -181,11 +200,6 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("github auth check failed: {s}", .{@errorName(err)});
     }
 
-    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d}", .{
-        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len,
-    });
-    notify.ready();
-
     const interval_ns: i96 = @as(i96, @intCast(cfg.poll_interval_sec)) * std.time.ns_per_s;
 
     var offset: i64 = (db.kvGetInt(offset_key) catch null) orelse 0;
@@ -199,8 +213,9 @@ pub fn main(init: std.process.Init) !void {
     var tg_failures: u32 = 0;
     var tg_backoff = backoff_mod.Backoff.init(nowSeedNs(), std.time.ns_per_s, 60 * std.time.ns_per_s);
     var github_paused_ns: i96 = 0;
+    var rate_limit_streak: u32 = 0;
 
-    while (!shutdown_flag.load(.seq_cst)) {
+    while (!runtime.shutdown.load(.seq_cst)) {
         notify.ping();
 
         const now = Io.Clock.Timestamp.now(io, .awake);
@@ -208,18 +223,34 @@ pub fn main(init: std.process.Init) !void {
         const effective_interval = interval_ns + github_paused_ns;
         if (elapsed_ns >= effective_interval) {
             std.log.info("status poll triggered (elapsed={d}s)", .{@divTrunc(elapsed_ns, std.time.ns_per_s)});
+            tracker.gh_pause = .none;
             if (tracker.runOnce()) {
                 github_paused_ns = 0;
-                alertGithubAuth(gpa, &db, &tg, false);
+                rate_limit_streak = 0;
+                // A sweep with zero tracked PRs makes no GitHub call, so it
+                // proves nothing about auth; verify before announcing
+                // recovery. /rate_limit is quota-free.
+                const alerted = (db.kvGetInt(auth_alert_key) catch null) orelse 0;
+                if (alerted != 0) {
+                    if (gh.checkAuth()) |_| {
+                        alertGithubAuth(gpa, &db, &tg, false);
+                    } else |_| {}
+                }
             } else |err| switch (err) {
                 error.GithubUnauthorized => {
                     std.log.err("github auth failed; pausing tracking for {d}s", .{github_unauthorized_pause_sec});
                     github_paused_ns = @max(0, @as(i96, github_unauthorized_pause_sec) * std.time.ns_per_s - interval_ns);
+                    tracker.gh_pause = .unauthorized;
                     alertGithubAuth(gpa, &db, &tg, true);
                 },
                 error.GithubRateLimited => {
                     std.log.warn("github rate limited; pausing tracking for {d}s", .{github_ratelimit_pause_sec});
                     github_paused_ns = @max(0, @as(i96, github_ratelimit_pause_sec) * std.time.ns_per_s - interval_ns);
+                    tracker.gh_pause = .rate_limited;
+                    rate_limit_streak += 1;
+                    if (rate_limit_streak == max_consecutive_rate_limits) {
+                        _ = broadcast(gpa, &db, &tg, ratelimit_stuck_text);
+                    }
                 },
                 else => std.log.warn("status poll failed: {s}", .{@errorName(err)}),
             }
@@ -259,7 +290,7 @@ pub fn main(init: std.process.Init) !void {
             std.log.warn("getUpdates failed ({s}); retry {d}/{d} in {d}ms", .{
                 @errorName(err), tg_failures, max_consecutive_tg_failures, delay / std.time.ns_per_ms,
             });
-            sleepNs(io, delay);
+            runtime.sleepInterruptible(io, delay);
             continue;
         };
         defer updates.deinit();
@@ -275,10 +306,9 @@ pub fn main(init: std.process.Init) !void {
                 std.log.warn("dispatch update {d} failed: {s}", .{ u.update_id, @errorName(err) });
             };
             // Advance past failed updates too — a poison message must not
-            // wedge the queue.
+            // wedge the queue. Persist per update so a crash mid-batch
+            // doesn't replay commands that already ran.
             offset = u.update_id + 1;
-        }
-        if (updates.items().len > 0) {
             db.kvSetInt(offset_key, offset) catch |err| {
                 std.log.warn("persist offset: {s}", .{@errorName(err)});
             };

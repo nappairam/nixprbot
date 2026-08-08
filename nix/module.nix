@@ -67,9 +67,11 @@ in
     };
 
     environmentFile = lib.mkOption {
-      type = lib.types.path;
+      # types.str, not types.path: a path literal would import the secrets
+      # into the world-readable store, silently defeating the whole point.
+      type = lib.types.str;
       description = ''
-        Path to a file containing NIXPRBOT_TOKEN=... and
+        Absolute path to a file containing NIXPRBOT_TOKEN=... and
         NIXPRBOT_GITHUB_TOKEN=... (both required) — read by systemd via
         EnvironmentFile so secrets do not end up in the Nix store.
       '';
@@ -80,18 +82,24 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = lib.hasPrefix "/var/lib/" cfg.stateDir && stateDirName != "";
-        message = "services.nixprbot.stateDir must be a path under /var/lib (got ${cfg.stateDir}).";
+        assertion = lib.hasPrefix "/var/lib/" cfg.stateDir
+          && stateDirName != ""
+          && !lib.hasInfix ".." cfg.stateDir;
+        message = "services.nixprbot.stateDir must be a plain path under /var/lib (got ${cfg.stateDir}).";
       }
     ];
 
-    users.users.${cfg.user} = {
-      isSystemUser = true;
-      group = cfg.group;
-      home = cfg.stateDir;
-      createHome = false;
+    # Only manage the account when it's ours; a custom cfg.user points at an
+    # account someone else defines.
+    users.users = lib.mkIf (cfg.user == "nixprbot") {
+      nixprbot = {
+        isSystemUser = true;
+        group = cfg.group;
+        home = cfg.stateDir;
+        createHome = false;
+      };
     };
-    users.groups.${cfg.group} = { };
+    users.groups = lib.mkIf (cfg.group == "nixprbot") { nixprbot = { }; };
 
     systemd.services.nixprbot = {
       description = "nixpkgs PR tracker Telegram bot";

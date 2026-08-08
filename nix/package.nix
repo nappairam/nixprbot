@@ -30,10 +30,13 @@ stdenv.mkDerivation (finalAttrs: {
     export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-cache"
   '';
 
+  # -Dcpu=baseline: without it zig compiles for the builder's native CPU and
+  # the substituted binary can SIGILL on older microarchitectures.
   buildPhase = ''
     runHook preBuild
     zig build install \
       --system "${finalAttrs.deps}" \
+      -Dcpu=baseline \
       -Doptimize=ReleaseSafe \
       --prefix "$out"
     runHook postBuild
@@ -42,7 +45,8 @@ stdenv.mkDerivation (finalAttrs: {
   checkPhase = ''
     runHook preCheck
     zig build test \
-      --system "${finalAttrs.deps}"
+      --system "${finalAttrs.deps}" \
+      -Dcpu=baseline
     runHook postCheck
   '';
 
