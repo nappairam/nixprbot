@@ -161,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
     var notify = try notify_mod.Notify.init(gpa, env.get("NOTIFY_SOCKET"), env.get("WATCHDOG_USEC"));
     defer notify.deinit();
 
-    const db_path_z = try gpa.dupeZ(u8, cfg.db_path);
+    const db_path_z = try gpa.dupeSentinel(u8, cfg.db_path, 0);
     defer gpa.free(db_path_z);
     var db = try db_mod.Db.open(db_path_z);
     defer db.close();

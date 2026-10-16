@@ -1,7 +1,7 @@
 { lib
 , stdenv
 , callPackage
-, zig_0_16
+, zig_0_17
 }:
 
 stdenv.mkDerivation (finalAttrs: {
@@ -19,7 +19,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   deps = callPackage ./deps.nix { };
 
-  nativeBuildInputs = [ zig_0_16 ];
+  nativeBuildInputs = [ zig_0_17 ];
 
   dontConfigure = true;
   doCheck = true;

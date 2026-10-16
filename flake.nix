@@ -21,7 +21,7 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ zig_0_16 zls sqlite zon2nix ];
+          packages = with pkgs; [ zig_0_17 zls sqlite zon2nix ];
         };
       });
 

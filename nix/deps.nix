@@ -4,11 +4,11 @@
 
 linkFarm "zig-packages" [
   {
-    name = "zqlite-0.0.1-RWLaY64xnAAxsD2YNT8QqPMJUuaFv2GOzFRR4aGypJv3";
+    name = "zqlite-0.0.1-RWLaY4Y8nADz2l5aBE-JVyDyM3sZzHjq0agNykuVZKqQ";
     path = fetchgit {
       url = "https://github.com/karlseguin/zqlite.zig";
-      rev = "5ac4cabe95a6d7faa7baf0da8057a8e6e8a227a1";
-      hash = "sha256-gdYleac8guMRLmDgIko2nL9e6U2pbFU1mKc79OknImI=";
+      rev = "865223b734a5113f731ab1eb1d7d81c8ac252913";
+      hash = "sha256-nsJJqsyX0axkQ1NB3JDrJhUarl+Pe2g9LoFjBVF3FjU=";
     };
   }
 ]

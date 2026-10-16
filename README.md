@@ -6,7 +6,7 @@ again as the merge commit lands in `master`, `nixos-unstable-small`,
 `nixos-unstable`, and friends. Auto-untracks once every configured branch is
 reached (or the PR is closed).
 
-Zig 0.16, SQLite ([zqlite](https://github.com/karlseguin/zqlite.zig)), no other
+Zig 0.17, SQLite ([zqlite](https://github.com/karlseguin/zqlite.zig)), no other
 runtime dependencies. Single static-ish binary.
 
 ## Commands

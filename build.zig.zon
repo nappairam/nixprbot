@@ -2,11 +2,11 @@
     .name = .nixprbot,
     .version = "0.2.0",
     .fingerprint = 0x9fa6bea131088bf2, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zqlite = .{
-            .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#5ac4cabe95a6d7faa7baf0da8057a8e6e8a227a1",
-            .hash = "zqlite-0.0.1-RWLaY64xnAAxsD2YNT8QqPMJUuaFv2GOzFRR4aGypJv3",
+            .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#865223b734a5113f731ab1eb1d7d81c8ac252913",
+            .hash = "zqlite-0.0.1-RWLaY4Y8nADz2l5aBE-JVyDyM3sZzHjq0agNykuVZKqQ",
         },
     },
     .paths = .{
