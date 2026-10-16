@@ -72,8 +72,8 @@ pub const Heartbeat = struct {
             return;
         };
         defer resp.deinit();
-        if (@intFromEnum(resp.status) >= 300) {
-            std.log.warn("heartbeat status={d}", .{@intFromEnum(resp.status)});
+        if (@backingInt(resp.status) >= 300) {
+            std.log.warn("heartbeat status={d}", .{@backingInt(resp.status)});
         }
     }
 };

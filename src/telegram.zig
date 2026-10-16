@@ -88,7 +88,7 @@ pub const Client = struct {
 
         if (resp.status != .ok) {
             // Response bodies never contain the token; the URL does — log the former only.
-            std.log.warn("getUpdates status={d} body={s}", .{ @intFromEnum(resp.status), resp.body });
+            std.log.warn("getUpdates status={d} body={s}", .{ @backingInt(resp.status), resp.body });
             return statusToError(resp.status);
         }
 
@@ -156,7 +156,7 @@ pub const Client = struct {
             };
         }
         if (resp.status != .ok) {
-            std.log.warn("sendMessage status={d} body={s}", .{ @intFromEnum(resp.status), resp.body });
+            std.log.warn("sendMessage status={d} body={s}", .{ @backingInt(resp.status), resp.body });
         }
         return .{ .status = resp.status };
     }
@@ -186,7 +186,7 @@ pub const Client = struct {
 
         if (resp.status != .ok) {
             std.log.warn("setMyCommands status={d} body={s}", .{
-                @intFromEnum(resp.status), resp.body,
+                @backingInt(resp.status), resp.body,
             });
             return statusToError(resp.status);
         }

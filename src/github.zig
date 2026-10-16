@@ -87,7 +87,7 @@ pub const Client = struct {
 
         if (resp.status != .ok) {
             std.log.warn("github rate_limit status={d} body={s}", .{
-                @intFromEnum(resp.status), resp.body,
+                @backingInt(resp.status), resp.body,
             });
             return statusToError(resp.status);
         }
@@ -121,7 +121,7 @@ pub const Client = struct {
         if (resp.status != .ok) {
             if (resp.status != .not_found) {
                 std.log.warn("github getPr {d} status={d} body={s}", .{
-                    pr_number, @intFromEnum(resp.status), resp.body,
+                    pr_number, @backingInt(resp.status), resp.body,
                 });
             }
             return statusToError(resp.status);
@@ -162,7 +162,7 @@ pub const Client = struct {
         if (resp.status == .not_found) return false;
         if (resp.status != .ok) {
             std.log.warn("github compare {s}...{s} status={d}", .{
-                branch, commit_sha, @intFromEnum(resp.status),
+                branch, commit_sha, @backingInt(resp.status),
             });
             return statusToError(resp.status);
         }

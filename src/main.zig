@@ -75,7 +75,7 @@ fn timestampedLog(
     args: anytype,
 ) void {
     _ = scope;
-    if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
+    if (@backingInt(level) > @backingInt(runtime_log_level)) return;
 
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.REALTIME, &ts);
