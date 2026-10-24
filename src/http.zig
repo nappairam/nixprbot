@@ -14,10 +14,17 @@ pub const Response = struct {
     }
 };
 
+/// std.http.Client has no read or connect timeout, so a TCP path that dies
+/// mid-request blocks recvmsg until the watchdog kills the process. Must
+/// exceed the 30s Telegram long poll and, doubled by the stale-connection
+/// retry, stay under the 120s watchdog.
+pub const default_deadline: Io.Duration = .fromSeconds(45);
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
     inner: std.http.Client,
+    deadline: Io.Duration = default_deadline,
 
     pub fn init(allocator: std.mem.Allocator, io: Io) Client {
         return .{
@@ -72,7 +79,7 @@ pub const Client = struct {
 
         var alloc_w: Io.Writer.Allocating = .init(self.allocator);
 
-        const result = self.inner.fetch(.{
+        const result = self.fetchWithDeadline(.{
             .location = .{ .url = opts.url },
             .method = opts.method,
             .payload = normalizePayload(opts.method, opts.body),
@@ -92,6 +99,25 @@ pub const Client = struct {
             .status = result.status,
             .body = body,
             .allocator = self.allocator,
+        };
+    }
+
+    const Race = union(enum) {
+        fetch: std.http.Client.FetchError!std.http.Client.FetchResult,
+        deadline: Io.Cancelable!void,
+    };
+
+    /// Run the fetch on a worker and race it against a timer; whichever loses
+    /// is canceled (Io.Threaded interrupts the blocked syscall with SIGIO).
+    fn fetchWithDeadline(self: *Client, opts: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+        var buf: [2]Race = undefined;
+        var race: Io.Select(Race) = .init(self.io, &buf);
+        defer race.cancelDiscard();
+        try race.concurrent(.fetch, std.http.Client.fetch, .{ &self.inner, opts });
+        try race.concurrent(.deadline, Io.sleep, .{ self.io, self.deadline, .awake });
+        return switch (try race.await()) {
+            .fetch => |r| r,
+            .deadline => error.RequestDeadlineExceeded,
         };
     }
 };
@@ -117,4 +143,21 @@ test "normalizePayload gives body-carrying methods an empty body" {
     try std.testing.expect(normalizePayload(null, null) == null);
     try std.testing.expectEqualStrings("x", normalizePayload(.POST, "x").?);
     try std.testing.expectEqualStrings("x", normalizePayload(.GET, "x").?);
+}
+
+test "request against a server that never answers fails at the deadline" {
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    // The kernel completes the handshake from the backlog; nothing ever accepts.
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+
+    var client: Client = .init(std.testing.allocator, io);
+    defer client.deinit();
+    client.deadline = .fromMilliseconds(200);
+
+    try std.testing.expectError(error.RequestDeadlineExceeded, client.request(.{ .url = url }));
 }
