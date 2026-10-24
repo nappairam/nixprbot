@@ -132,7 +132,7 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
         RestartSteps = 8;
-        RestartMaxDelaySec = "10min";
+        RestartMaxDelaySec = "30s";
 
         # Hardening
         NoNewPrivileges = true;
