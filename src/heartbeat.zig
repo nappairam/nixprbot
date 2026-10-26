@@ -19,6 +19,8 @@ pub const Heartbeat = struct {
     min_interval_ns: i128 = 60 * std.time.ns_per_s,
     last_attempt_ns: i128 = 0,
     last_kind: Kind = .none,
+    note_buf: [256]u8 = undefined,
+    note_len: usize = 0,
 
     const Kind = enum { none, ok, fail };
 
@@ -30,12 +32,19 @@ pub const Heartbeat = struct {
         return self.url != null;
     }
 
+    /// Attach text to the next beat that gets out; healthchecks.io keeps
+    /// ping bodies in its event log, which makes them a remote readout.
+    pub fn setNote(self: *Heartbeat, text: []const u8) void {
+        self.note_len = @min(text.len, self.note_buf.len);
+        @memcpy(self.note_buf[0..self.note_len], text[0..self.note_len]);
+    }
+
     pub fn beat(self: *Heartbeat) void {
-        self.send(.ok, null);
+        if (self.send(.ok, if (self.note_len > 0) self.note_buf[0..self.note_len] else null)) self.note_len = 0;
     }
 
     pub fn fail(self: *Heartbeat, reason: []const u8) void {
-        self.send(.fail, reason);
+        _ = self.send(.fail, reason);
     }
 
     /// Same-state pings are rate-limited to one attempt a minute (counting
@@ -52,13 +61,14 @@ pub const Heartbeat = struct {
         return true;
     }
 
-    fn send(self: *Heartbeat, kind: Kind, body: ?[]const u8) void {
-        const base = self.url orelse return;
-        if (!self.gate(kind, monotonicNs())) return;
+    /// True when the receiver accepted the ping.
+    fn send(self: *Heartbeat, kind: Kind, body: ?[]const u8) bool {
+        const base = self.url orelse return false;
+        if (!self.gate(kind, monotonicNs())) return false;
 
         var url_buf: [512]u8 = undefined;
         const url = switch (kind) {
-            .fail => std.fmt.bufPrint(&url_buf, "{s}/fail", .{base}) catch return,
+            .fail => std.fmt.bufPrint(&url_buf, "{s}/fail", .{base}) catch return false,
             else => base,
         };
 
@@ -69,12 +79,14 @@ pub const Heartbeat = struct {
             .headers = &.{.{ .name = "content-type", .value = "text/plain" }},
         }) catch |err| {
             std.log.warn("heartbeat: {s}", .{@errorName(err)});
-            return;
+            return false;
         };
         defer resp.deinit();
         if (@backingInt(resp.status) >= 300) {
             std.log.warn("heartbeat status={d}", .{@backingInt(resp.status)});
+            return false;
         }
+        return true;
     }
 };
 

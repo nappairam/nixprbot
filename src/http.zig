@@ -25,6 +25,7 @@ pub const Client = struct {
     io: Io,
     inner: std.http.Client,
     deadline: Io.Duration = default_deadline,
+    deadline_hits: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: Io) Client {
         return .{
@@ -117,7 +118,10 @@ pub const Client = struct {
         try race.concurrent(.deadline, Io.sleep, .{ self.io, self.deadline, .awake });
         return switch (try race.await()) {
             .fetch => |r| r,
-            .deadline => error.RequestDeadlineExceeded,
+            .deadline => {
+                self.deadline_hits += 1;
+                return error.RequestDeadlineExceeded;
+            },
         };
     }
 };

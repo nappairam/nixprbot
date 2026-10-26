@@ -10,6 +10,7 @@ const tracker_mod = @import("tracker.zig");
 const backoff_mod = @import("backoff.zig");
 const notify_mod = @import("notify.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const netprobe = @import("netprobe.zig");
 const runtime = @import("runtime.zig");
 
 pub const std_options: std.Options = .{
@@ -176,6 +177,8 @@ pub fn main(init: std.process.Init) !void {
     var gh = github.Client.init(gpa, &http_client, cfg.github_token, cfg.repo);
     var tracker = tracker_mod.Tracker.init(gpa, &db, &gh, &tg, cfg.branches, &notify);
     var hb = heartbeat_mod.Heartbeat.init(&http_client, cfg.heartbeat_url);
+    var probe = netprobe.Prober.init(io, "api.telegram.org");
+    var deadline_hits_reported: u32 = 0;
 
     installSignalHandlers();
     runtime.notify = &notify;
@@ -228,6 +231,18 @@ pub fn main(init: std.process.Init) !void {
 
     while (!runtime.shutdown.load(.seq_cst)) {
         notify.ping();
+
+        if (probe.tick()) |hour| {
+            const hits = http_client.deadline_hits -% deadline_hits_reported;
+            deadline_hits_reported = http_client.deadline_hits;
+            var round_buf: [128]u8 = undefined;
+            var note_buf: [256]u8 = undefined;
+            const note = std.fmt.bufPrint(&note_buf, "netprobe api.telegram.org last hour: {s}; request deadlines hit: {d}", .{
+                netprobe.formatRound(&round_buf, hour), hits,
+            }) catch "";
+            std.log.info("{s}", .{note});
+            hb.setNote(note);
+        }
 
         const now = Io.Clock.Timestamp.now(io, .awake);
         const elapsed_ns = last_status_poll.durationTo(now).raw.nanoseconds;

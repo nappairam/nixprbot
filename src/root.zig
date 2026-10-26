@@ -9,10 +9,12 @@ pub const backoff = @import("backoff.zig");
 pub const notify = @import("notify.zig");
 pub const runtime = @import("runtime.zig");
 pub const heartbeat = @import("heartbeat.zig");
+pub const netprobe = @import("netprobe.zig");
 
 test {
     _ = runtime;
     _ = heartbeat;
+    _ = netprobe;
     _ = config;
     _ = db;
     _ = http;
