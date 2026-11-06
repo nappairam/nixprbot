@@ -25,6 +25,9 @@ var runtime_log_level: std.log.Level = .info;
 // previous deployment wedged for 68 days precisely because it retried a
 // poisoned HTTP client in-process forever.
 const max_consecutive_tg_failures = 15;
+// Telegram 502 bursts clear within seconds; only polling that stays broken
+// for a healthchecks.io period is worth a labeled alert.
+const tg_fail_alert_after: Io.Duration = .fromSeconds(5 * 60);
 const github_unauthorized_pause_sec = 3600;
 const github_ratelimit_pause_sec = 900;
 // A rate limit that survives this many consecutive sweeps is not weather —
@@ -213,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     var tg_failures: u32 = 0;
+    var tg_failing_since: ?Io.Clock.Timestamp = null;
     var tg_backoff = backoff_mod.Backoff.init(nowSeedNs(), std.time.ns_per_s, 60 * std.time.ns_per_s);
     var github_paused_ns: i96 = 0;
     var rate_limit_streak: u32 = 0;
@@ -304,6 +308,9 @@ pub fn main(init: std.process.Init) !void {
                 else => {},
             }
             tg_failures += 1;
+            const failed_at = Io.Clock.Timestamp.now(io, .awake);
+            const failing_since = tg_failing_since orelse failed_at;
+            tg_failing_since = failing_since;
             if (tg_failures >= max_consecutive_tg_failures) {
                 std.log.err("getUpdates failed {d} times in a row ({s}); exiting for a fresh start", .{
                     tg_failures, @errorName(err),
@@ -313,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
             }
             // hc-ping.com is a different host than api.telegram.org, so a
             // labeled fail often still gets out while Telegram is unreachable.
-            if (tg_failures >= 5) hb.fail("telegram polling failing; see journal");
+            if (failingTooLong(failing_since, failed_at)) hb.fail("telegram polling failing for 5+ minutes; see journal");
             const delay = tg_backoff.next();
             std.log.warn("getUpdates failed ({s}); retry {d}/{d} in {d}ms", .{
                 @errorName(err), tg_failures, max_consecutive_tg_failures, delay / std.time.ns_per_ms,
@@ -323,6 +330,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer updates.deinit();
         tg_failures = 0;
+        tg_failing_since = null;
         tg_backoff.reset();
 
         if (updates.items().len > 0) {
@@ -350,4 +358,21 @@ pub fn main(init: std.process.Init) !void {
     }
     std.log.info("shutdown signal received; exiting cleanly", .{});
     notify.stopping();
+}
+
+fn failingTooLong(since: Io.Clock.Timestamp, now: Io.Clock.Timestamp) bool {
+    return since.durationTo(now).raw.nanoseconds >= tg_fail_alert_after.nanoseconds;
+}
+
+test "a short Telegram outage does not alert, a 5 minute one does" {
+    const at = struct {
+        fn f(sec: i96) Io.Clock.Timestamp {
+            return .{ .raw = .{ .nanoseconds = sec * std.time.ns_per_s }, .clock = .awake };
+        }
+    }.f;
+    // Nov 5: 502 burst at 09:16:05, polling back by ~09:19.
+    try std.testing.expect(!failingTooLong(at(0), at(11)));
+    try std.testing.expect(!failingTooLong(at(0), at(180)));
+    try std.testing.expect(!failingTooLong(at(0), at(299)));
+    try std.testing.expect(failingTooLong(at(0), at(300)));
 }
