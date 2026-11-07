@@ -177,6 +177,7 @@ pub fn main(init: std.process.Init) !void {
     var gh = github.Client.init(gpa, &http_client, cfg.github_token, cfg.repo);
     var tracker = tracker_mod.Tracker.init(gpa, &db, &gh, &tg, cfg.branches, &notify);
     var hb = heartbeat_mod.Heartbeat.init(&http_client, cfg.heartbeat_url);
+    var probe_hb = heartbeat_mod.Heartbeat.init(&http_client, cfg.netprobe_url);
     var probe = netprobe.Prober.init(io, "api.telegram.org");
     var deadline_hits_reported: u32 = 0;
 
@@ -186,8 +187,8 @@ pub fn main(init: std.process.Init) !void {
     // READY before any network call: setMyCommands/checkAuth have no request
     // timeout, and under Type=notify a startup stall would flap the unit via
     // TimeoutStartSec. Once READY is sent, the watchdog owns hang detection.
-    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d} heartbeat={}", .{
-        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len, hb.enabled(),
+    std.log.info("nixprbot up. db={s} interval={d}s repo={s} branches={d} heartbeat={} netprobe_check={}", .{
+        cfg.db_path, cfg.poll_interval_sec, cfg.repo, cfg.branches.len, hb.enabled(), probe_hb.enabled(),
     });
     notify.ready();
     notify.ping();
@@ -241,7 +242,8 @@ pub fn main(init: std.process.Init) !void {
                 netprobe.formatRound(&round_buf, hour), hits,
             }) catch "";
             std.log.info("{s}", .{note});
-            hb.setNote(note);
+            probe_hb.setNote(note);
+            probe_hb.beat();
         }
 
         const now = Io.Clock.Timestamp.now(io, .awake);

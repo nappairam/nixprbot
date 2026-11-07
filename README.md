@@ -31,6 +31,7 @@ runtime dependencies. Single static-ish binary.
 | `NIXPRBOT_REPO` | `NixOS/nixpkgs` | |
 | `NIXPRBOT_LOG` | `info` | `debug`/`info`/`warn`/`err` |
 | `NIXPRBOT_HEARTBEAT_URL` | unset | Dead-man ping URL (healthchecks.io / Better Stack); secret — the token is in the URL |
+| `NIXPRBOT_NETPROBE_URL` | unset | Separate check that gets the hourly netprobe summary as a ping body; give it a 1h period. Secret, like the heartbeat URL |
 
 ## Failure policy
 

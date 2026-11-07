@@ -9,6 +9,7 @@ pub const Config = struct {
     repo: []const u8,
     log_level: std.log.Level,
     heartbeat_url: ?[]const u8,
+    netprobe_url: ?[]const u8,
 
     arena: std.heap.ArenaAllocator,
 
@@ -56,6 +57,7 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
         .info;
 
     const heartbeat_url = env.get("NIXPRBOT_HEARTBEAT_URL");
+    const netprobe_url = env.get("NIXPRBOT_NETPROBE_URL");
 
     return .{
         .bot_token = try a.dupe(u8, bot_token),
@@ -66,6 +68,7 @@ pub fn load(parent_allocator: std.mem.Allocator, env: *const std.process.Environ
         .repo = try a.dupe(u8, repo),
         .log_level = log_level,
         .heartbeat_url = if (heartbeat_url) |u| try a.dupe(u8, u) else null,
+        .netprobe_url = if (netprobe_url) |u| try a.dupe(u8, u) else null,
         .arena = arena,
     };
 }
